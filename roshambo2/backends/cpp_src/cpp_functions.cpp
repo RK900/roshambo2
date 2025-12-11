@@ -28,6 +28,8 @@
 #include <omp.h>
 #include <cassert>
 
+#include "cpp_helper_functions.h"
+
 #define DTYPE float
 
 namespace py = pybind11;
@@ -54,95 +56,6 @@ const std::array<int, 3> start_mode_n = {1,4,10};
 ////////////////////////////////////////////////////////////////////////////////
 /// Math helper functions
 ////////////////////////////////////////////////////////////////////////////////
-
-/// @brief 3x3 matrix x vector
-/// @param mat matrix[3,3]
-/// @param vec 3 vector[3]
-/// @param result 3 vector[3]
-void matvec3x3x3(DTYPE mat[][3], const DTYPE * vec, DTYPE * result){
-
-    // only transforms the first 3 values in the array! The 4th value is not a 
-    // coordinate so we do not transform it
-
-    result[0] = 0.0;
-    result[1] = 0.0;
-    result[2] = 0.0;
-
-    for (int i = 0; i < 3; ++i) {
-        for (int j = 0; j < 3; ++j) {
-            result[i] += mat[i][j] * vec[j];
-        }
-    }
-}
-
-/// @brief 3x3 matrix x vector
-/// @param mat matrix[3,3]
-/// @param vec 3 vector[3]
-/// @param result 3 vector[3]
-void matvec3x3x3(const std::array<std::array<DTYPE,3>,3> &mat, const DTYPE * vec, DTYPE * result){
-
-    // only transforms the first 3 values in the array! The 4th value is not a 
-    // coordinate so we do not transform it
-
-    result[0] = 0.0;
-    result[1] = 0.0;
-    result[2] = 0.0;
-
-    for (int i = 0; i < 3; ++i) {
-        for (int j = 0; j < 3; ++j) {
-            result[i] += mat[i][j] * vec[j];
-        }
-    }
-}
-
-/// @brief 3x3 matrix x vector
-/// @param mat matrix[3,3]
-/// @param vec 3 vector[3]
-/// @return result 3 vector[3]
-std::array<DTYPE,3> matvec3x3x3(const std::array<std::array<DTYPE,3>,3> &mat, const DTYPE * vec){
-
-    // only transforms the first 3 values in the array! The 4th value is not a 
-    // coordinate so we do not transform it
-    std::array<DTYPE,3> result;
-    result[0] = 0.0;
-    result[1] = 0.0;
-    result[2] = 0.0;
-
-    for (int i = 0; i < 3; ++i) {
-        for (int j = 0; j < 3; ++j) {
-            result[i] += mat[i][j] * vec[j];
-        }
-    }
-
-    return result;
-}
-
-
-
-
-/// @brief convert quaternion to rotation matrix
-/// @param q quaternion[4]
-/// @param M matrix[3,3]
-void quaternion_to_rotation_matrix(std::array<DTYPE,4> &q, DTYPE M[3][3]){
-
-    // temp variables to make more readable
-    auto w = q[0];
-    auto x = q[1];
-    auto y = q[2];
-    auto z = q[3];
-
-    // Compute rotation matrix elements
-    M[0][0] = 1 - 2*y*y - 2*z*z;
-    M[0][1] = 2*x*y - 2*w*z;
-    M[0][2] = 2*x*z + 2*w*y;
-    M[1][0] = 2*x*y + 2*w*z;
-    M[1][1] = 1 - 2*x*x - 2*z*z;
-    M[1][2] = 2*y*z - 2*w*x;
-    M[2][0] = 2*x*z - 2*w*y;
-    M[2][1] = 2*y*z + 2*w*x;
-    M[2][2] = 1 - 2*x*x - 2*y*y;
-}
-
 
 /// @brief convert quaternion to rotation matrix
 /// @param q quaternion[4]
@@ -215,111 +128,6 @@ std::array<DTYPE,4> axis_angle_to_quat(std::array<DTYPE,4> axis_angle){
     q[3] = axis_angle[2]*sin(hangle);
 
     return q;
-}
-
-
-
-
-/// @brief translate molA to molAT by t
-/// @param t vector[3]
-/// @param molA molecular coordinates[N,3]
-/// @param molAT molecular coordinates[N,3]
-/// @param NmolA N
-void translate(DTYPE t[3], const DTYPE * molA, DTYPE * molAT, int NmolA){
-
-    // only transforms the first 3 values in the array! The 4th value is not a 
-    // coordinate so we do not transform it
-
-    for(int i=0;i<NmolA;i++){
-
-        auto x = &molA[i*D];
-        auto y = &molAT[i*D];
-
-        y[0] = x[0] + t[0];
-        y[1] = x[1] + t[1];
-        y[2] = x[2] + t[2];
-    }
-}
-
-
-/// @brief transform molB by mat
-/// @param mat matrix[3,3]
-/// @param molB molecular coordinates[N,3]
-/// @param molBT molecular coordinates[N,3]
-/// @param NmolB N
-void transform(DTYPE mat[][3], const DTYPE * molB, DTYPE * molBT, int NmolB){
-
-    // only transforms the first 3 values in the array! The 4th value is not a 
-    // coordinate so we do not transform it
-
-    for(int i=0;i<NmolB;i++){
-
-        auto x = &molB[i*D];
-        auto y = &molBT[i*D];
-
-        matvec3x3x3(mat, x, y);
-    }
-}
-
-
-/// @brief division of std::array by scalar
-/// @tparam T 
-/// @tparam N 
-/// @param arr 
-/// @param scalar 
-/// @return 
-template<typename T, size_t N>
-std::array<T, N> operator/(const std::array<T, N>& arr, const T& scalar) {
-    std::array<T, N> result;
-    for (size_t i = 0; i < N; ++i) {
-        result[i] = arr[i] / scalar;
-    }
-    return result;
-}
-
-/// @brief product of std::array by scalar
-/// @tparam T 
-/// @tparam N 
-/// @param arr 
-/// @param scalar 
-/// @return 
-template<typename T, size_t N>
-std::array<T, N> operator*(const T& scalar, const std::array<T, N>& arr){
-    std::array<T, N> result;
-    for (size_t i = 0; i < N; ++i) {
-        result[i] = scalar*arr[i]; 
-    }
-    return result;
-}
-
-/// @brief addition of std::arrays
-/// @tparam T 
-/// @tparam N 
-/// @param arr1 
-/// @param arr2
-/// @return 
-template<typename T, size_t N>
-std::array<T, N> operator+(const std::array<T, N>& arr1, const std::array<T, N>& arr2) {
-    std::array<T, N> result;
-    for (size_t i = 0; i < N; ++i) {
-        result[i] = arr1[i] + arr2[i];
-    }
-    return result;
-}
-
-/// @brief product of std::arrays
-/// @tparam T 
-/// @tparam N 
-/// @param arr1 
-/// @param arr2
-/// @return 
-template<typename T, size_t N>
-std::array<T, N> operator*(const std::array<T, N>& arr1, const std::array<T, N>& arr2) {
-    std::array<T, N> result;
-    for (size_t i = 0; i < N; ++i) {
-        result[i] = arr1[i]*arr2[i];
-    }
-    return result;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -446,240 +254,6 @@ std::array<DTYPE, 7> start_mode_transform(const DTYPE * mol, DTYPE * transformed
     return out;
 }
 
-
-
-///////////////////////////////////////////////////////////////////////////////
-/// Volume functions
-///////////////////////////////////////////////////////////////////////////////
-
-
-/// @brief shape overlap volume of molA and molB
-/// @param molA 
-/// @param NmolA 
-/// @param molB 
-/// @param NmolB 
-/// @return volume 
-DTYPE volume(const DTYPE * molA, int NmolA, const DTYPE * molB, int NmolB){
-
-    DTYPE V = 0.0;
-
-    for(int i=0; i < NmolA; i++){
-        for( int j=0; j<NmolB; j++){
-            
-            DTYPE dx = molA[i*D]   - molB[j*D];
-            DTYPE dy = molA[i*D+1] - molB[j*D+1];
-            DTYPE dz = molA[i*D+2] - molB[j*D+2];
-
-            DTYPE d2 = dx*dx + dy*dy + dz*dz;
-        
-            auto a1 = A;  // left easy to change to not doing all-carbon radii
-            auto a2 = A;
-            
-            DTYPE wa = molA[i*D+3]; // wa,wb == zero means it is a padded atom 
-            DTYPE wb = molB[j*D+3];
-
-            DTYPE kij = exp(-a1*a2*d2/(a1+a2))*wa*wb;
-
-            DTYPE vij = 8*kij*CONSTANT;
-
-            V += vij;
-        }
-    }
-
-    return V;
-}
-
-/// @brief color overlap volume of molA and molB
-/// @param molA 
-/// @param NmolA 
-/// @param molA_type 
-/// @param molB 
-/// @param NmolB 
-/// @param molB_type 
-/// @param rmat 
-/// @param pmat 
-/// @param N_features 
-/// @return volume
-DTYPE volume_color(const DTYPE * molA, int NmolA, const int * molA_type, 
-                   const DTYPE * molB, int NmolB, const int * molB_type, 
-                   const DTYPE * rmat, const DTYPE * pmat, int N_features){
-
-    DTYPE V = 0.0;
-
-    for(int i=0; i < NmolA; i++){
-        int ta = molA_type[i];
-        if (ta==0) break; // padded atoms are at the end and have type==0
-
-        for( int j=0; j<NmolB; j++){
-            int tb = molB_type[j];
-            if (tb==0) break;
-            
-            DTYPE dx = molA[i*D]   - molB[j*D];
-            DTYPE dy = molA[i*D+1] - molB[j*D+1];
-            DTYPE dz = molA[i*D+2] - molB[j*D+2];
-
-            DTYPE d2 = dx*dx + dy*dy + dz*dz;
-        
-            auto a = rmat[ta*N_features+tb];
-            auto p = pmat[ta*N_features+tb];
-        
-            
-            DTYPE wa = molA[i*D+3];
-            DTYPE wb = molB[j*D+3];
-
-            DTYPE kij = exp(-a*a*d2/(a+a))*wa*wb;
-
-            double constant = pow(PI/(2*a), 1.5);
-
-            DTYPE vij = p*p*kij*constant;
-
-            V += vij;
-        }
-    }
-
-    return V;
-}
-
-
-////////////////////////////////////////////////////////////////////////////////
-/// gradient functions
-////////////////////////////////////////////////////////////////////////////////
-
-/// @brief compute overlap gradients of molA and molB w.r.t molB
-/// @param molA 
-/// @param NmolA 
-/// @param molB 
-/// @param NmolB 
-/// @return array[7] containing the quaternion gradients and the position gradients
-std::array<DTYPE,7> get_gradient(const DTYPE * molA, int NmolA, const DTYPE * molB, int NmolB){
-
-    std::array<DTYPE,7> grad = {0.0,0.0,0.0,0.0,0.0,0.0,0.0};
-
-    for(int i=0; i < NmolA; i++){
-        for( int j=0; j<NmolB; j++){
-            
-            DTYPE dx = molA[i*D]   - molB[j*D];
-            DTYPE dy = molA[i*D+1] - molB[j*D+1];
-            DTYPE dz = molA[i*D+2] - molB[j*D+2];
-
-            DTYPE d2 = dx*dx + dy*dy + dz*dz;
-        
-            auto a1 = A; // left easy to change to not doing all-carbon radii
-            auto a2 = A;
-
-            DTYPE wa = molA[i*D+3];
-            DTYPE wb = molB[j*D+3];
-
-            DTYPE kij = exp(-a1*a2*d2/(a1+a2))*wa*wb;
-
-            DTYPE vij = 8*kij*CONSTANT;
-
-            DTYPE x = molB[j*D];
-            DTYPE y = molB[j*D+1];
-            DTYPE z = molB[j*D+2];
-
-            DTYPE sks[3][3] = {
-                {0,-2*z, 2*y},
-                {2*z,0,-2*x},
-                {-2*y,2*x,0}
-            };
-
-            DTYPE delta[3] = {dx, dy, dz};
-
-            DTYPE mv[3] = {0.0,0.0,0.0};
-
-            matvec3x3x3(sks, delta, mv);
-
-            grad[1] += -2.0*(a1*a2)/(a1+a2)*vij*mv[0];
-            grad[2] += -2.0*(a1*a2)/(a1+a2)*vij*mv[1];
-            grad[3] += -2.0*(a1*a2)/(a1+a2)*vij*mv[2];
-
-            // x,y,z
-            grad[4] += -2.0*(a1*a2)/(a1+a2)*vij*delta[0];
-            grad[5] += -2.0*(a1*a2)/(a1+a2)*vij*delta[1];
-            grad[6] += -2.0*(a1*a2)/(a1+a2)*vij*delta[2];
-        }
-    }
-
-    return grad;
-}
-
-
-/// @brief compute overlap color gradients of molA and molB w.r.t molB
-/// @param molA 
-/// @param NmolA 
-/// @param molA_type 
-/// @param molB 
-/// @param NmolB 
-/// @param molB_type 
-/// @param rmat 
-/// @param pmat 
-/// @param N_features 
-/// @return array[7] containing the quaternion gradients and the position gradients
-std::array<DTYPE,7> get_gradient_color(const DTYPE * molA, int NmolA, const int * molA_type, 
-                                       const DTYPE * molB, int NmolB, const int * molB_type, 
-                                       const DTYPE * rmat, const DTYPE * pmat, int N_features){
-
-    std::array<DTYPE,7> grad = {0.0,0.0,0.0,0.0,0.0,0.0,0.0};
-
-    DTYPE V=0.0;
-
-    for(int i=0; i < NmolA; i++){
-        int ta = molA_type[i];
-        if (ta==0) break;
-
-        for( int j=0; j<NmolB; j++){
-            int tb = molB_type[j];
-            if (tb==0) break;
-    
-            DTYPE dx = molA[i*D]   - molB[j*D];
-            DTYPE dy = molA[i*D+1] - molB[j*D+1];
-            DTYPE dz = molA[i*D+2] - molB[j*D+2];
-
-            DTYPE d2 = dx*dx + dy*dy + dz*dz;
-        
-            auto a = rmat[ta*N_features+tb];
-            auto p = pmat[ta*N_features+tb];
-
-            DTYPE wa = molA[i*D+3];
-            DTYPE wb = molB[j*D+3];
-            
-            DTYPE kij = exp(-a*a*d2/(a+a))*wa*wb;
-
-            double constant = pow(PI/(2*a), 1.5);
-
-            DTYPE vij = p*p*kij*constant;
-
-            DTYPE x = molB[j*D];
-            DTYPE y = molB[j*D+1];
-            DTYPE z = molB[j*D+2];
-
-            DTYPE sks[3][3] = {
-                {0,-2*z, 2*y},
-                {2*z,0,-2*x},
-                {-2*y,2*x,0}
-            };
-
-            DTYPE delta[3] = {dx, dy, dz};
-
-            DTYPE mv[3] = {0.0,0.0,0.0};
-
-            matvec3x3x3(sks, delta, mv);
-
-            grad[1] += -2.0*(a*a)/(a+a)*vij*mv[0];
-            grad[2] += -2.0*(a*a)/(a+a)*vij*mv[1];
-            grad[3] += -2.0*(a*a)/(a+a)*vij*mv[2];
-
-            // x,y,z
-            grad[4] += -2.0*(a*a)/(a+a)*vij*delta[0];
-            grad[5] += -2.0*(a*a)/(a+a)*vij*delta[1];
-            grad[6] += -2.0*(a*a)/(a+a)*vij*delta[2];
-        }
-    }
-    return grad;
-}
-
-
 ////////////////////////////////////////////////////////////////////////////////
 /// helper functions for self overlap
 ////////////////////////////////////////////////////////////////////////////////
@@ -727,52 +301,30 @@ std::array<DTYPE,2> self_overlap_single_color(py::array_t<DTYPE> A, py::array_t<
 
 }
 
-
-
-////////////////////////////////////////////////////////////////////////////////
-/// Optimization functions
-////////////////////////////////////////////////////////////////////////////////
-
-
-// Adagrad optimization step
-void adagrad_step(std::array<DTYPE,4> &q, std::array<DTYPE,3> &t,  std::array<DTYPE,7> g, 
-                  std::array<DTYPE,7> &cache, DTYPE lr_q, DTYPE lr_t) {
-
-    cache =  cache + g*g;
-
-    q[0] -= lr_q*g[0]/(sqrt(cache[0])+EPSILON);
-    q[1] -= lr_q*g[1]/(sqrt(cache[1])+EPSILON);
-    q[2] -= lr_q*g[2]/(sqrt(cache[2])+EPSILON);
-    q[3] -= lr_q*g[3]/(sqrt(cache[3])+EPSILON);
-
-    t[0] -= lr_t*g[4]/(sqrt(cache[4])+EPSILON);
-    t[1] -= lr_t*g[5]/(sqrt(cache[5])+EPSILON);
-    t[2] -= lr_t*g[6]/(sqrt(cache[6])+EPSILON);
-}
-
-
-
-
-
 /// @brief optimization function. Entry point to c++ code from python (via pybind)
-/// @param A 
-/// @param AT 
-/// @param AN 
-/// @param B 
-/// @param BT 
-/// @param BN 
-/// @param RMAT 
-/// @param PMAT 
-/// @param V 
-/// @param optim_color 
-/// @param mixing_param 
+/// @param A - the padded query coordinate data
+/// @param AT - the padded query types
+/// @param AN - the number of heavy atoms
+/// @param B - the padded target coordinate data
+/// @param BT - the padded query types
+/// @param BN - the number of heavy atoms
+/// @param RMAT - interaction matrix r - square matrix for looking up r for features
+/// @param PMAT - interaction matrix p - square matrix for looking up p for features
+/// @param V - the output scores
+/// @param optim_color - whether to optimise on colors as well as shape
+/// @param mixing_param - how to mix the 2 tanimoto values
+/// @param lr_q - scale factor for optimising the quaternion (?)
+/// @param lr_t - scale factor for optimising the translation (?)
+/// @param nsteps - number of optimiser steps
+/// @param start_mode_method - 0, 1, or 2 with increasingly more start points
+/// @param loglevel - how wordy the output should be
 void optimize_overlap_color(py::array_t<DTYPE> A, py::array_t<int> AT, py::array_t<int> AN,
                             py::array_t<DTYPE> B, py::array_t<int> BT, py::array_t<int> BN, 
                             py::array_t<DTYPE> RMAT, py::array_t<DTYPE> PMAT, py::array_t<DTYPE> V, 
                             bool optim_color, DTYPE mixing_param, DTYPE lr_q, DTYPE lr_t, int nsteps,
                             int start_mode_method, int loglevel){
 
-
+	std::cout << "WIBBLE WIBBLE WIBBLE" << std::endl;
     // shared arrays/pointers
     auto molAs  = A.unchecked<3>();
     auto molA_type = AT.unchecked<2>();
@@ -794,11 +346,6 @@ void optimize_overlap_color(py::array_t<DTYPE> A, py::array_t<int> AT, py::array
     auto scores = V.mutable_unchecked<3>();
 
     assert(scores.shape(2) == 20);
-
-
-    DTYPE lr = lr_q;
-    DTYPE lrt = lr_t;
-
 
     int numThreads = omp_get_max_threads();
 
