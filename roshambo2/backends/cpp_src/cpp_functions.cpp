@@ -306,7 +306,7 @@ std::array<DTYPE,2> self_overlap_single_color(py::array_t<DTYPE> A, py::array_t<
 /// @param AT - the padded query types
 /// @param AN - the number of heavy atoms
 /// @param B - the padded target coordinate data
-/// @param BT - the padded query types
+/// @param BT - the padded target types
 /// @param BN - the number of heavy atoms
 /// @param RMAT - interaction matrix r - linearised square matrix for looking up r for features
 /// @param PMAT - interaction matrix p - linearised square matrix for looking up p for features
