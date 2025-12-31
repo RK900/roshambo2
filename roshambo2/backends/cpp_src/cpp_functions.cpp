@@ -313,8 +313,8 @@ std::array<DTYPE,2> self_overlap_single_color(py::array_t<DTYPE> A, py::array_t<
 /// @param V - the output scores
 /// @param optim_color - whether to optimise on colors as well as shape
 /// @param mixing_param - how to mix the 2 tanimoto values
-/// @param lr_q - scale factor for optimising the quaternion (?)
-/// @param lr_t - scale factor for optimising the translation (?)
+/// @param lr_q - learning rate for optimising the quaternion
+/// @param lr_t - learning rate for optimising the translation
 /// @param nsteps - number of optimiser steps
 /// @param start_mode_method - 0, 1, or 2 with increasingly more start points
 /// @param loglevel - how wordy the output should be
@@ -402,10 +402,10 @@ void optimize_overlap_color(py::array_t<DTYPE> A, py::array_t<int> AT, py::array
                 int NmolB_color = NmolB -NmolB_real;
 
 				DTYPE these_scores[20];
-				single_conformer_optimiser(ptr_molA, molAT, &ptr_molA_type[NmolA_real],
+				single_conformer_optimiser(ptr_molA, molAT, ptr_molA_type,
                                            NmolA, NmolA_real, NmolA_color,
 										   self_overlap_A, self_overlap_A_color,
-                                           ptr_molB, molBT, &ptr_molB_type[NmolB_real],
+                                           ptr_molB, molBT, ptr_molB_type,
 										   NmolB, NmolB_real, NmolB_color, ptr_rmat, ptr_pmat, N_features,
 										   optim_color, mixing_param, lr_q, lr_t, nsteps, these_scores);
 
@@ -420,13 +420,13 @@ void optimize_overlap_color(py::array_t<DTYPE> A, py::array_t<int> AT, py::array
                     scores(k,j,6) = these_scores[6]; // self j
                     scores(k,j,7) = these_scores[7]; // self i color
                     scores(k,j,8) = these_scores[8]; // self j color
-                    scores(k,j,9)  = these_scores[9];
-                    scores(k,j,10) = these_scores[10];
-                    scores(k,j,11) = these_scores[11];
-                    scores(k,j,12) = these_scores[12];
-                    scores(k,j,13) = these_scores[13];
-                    scores(k,j,14) = these_scores[14];
-                    scores(k,j,15) = these_scores[15];
+                    scores(k,j,9)  = these_scores[9]; // optimised quaternion value
+                    scores(k,j,10) = these_scores[10]; // optimised quaternion value
+                    scores(k,j,11) = these_scores[11]; // optimised quaternion value
+                    scores(k,j,12) = these_scores[12]; // optimised quaternion value
+                    scores(k,j,13) = these_scores[13]; // optimised translation value
+                    scores(k,j,14) = these_scores[14]; // optimised translation value
+                    scores(k,j,15) = these_scores[15]; // optimised translation value
                     scores(k,j,16) = start_qr[0];
                     scores(k,j,17) = start_qr[1];
                     scores(k,j,18) = start_qr[2];
