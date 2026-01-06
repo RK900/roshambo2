@@ -29,13 +29,13 @@ using DTYPE = float;
 ////////////////////////////////////////////////////////////////////////////////
 /// Constants
 ////////////////////////////////////////////////////////////////////////////////
-const int D = 4;
-const DTYPE PI = 3.14159265358;
-const DTYPE KAPPA = 2.41798793102;
-const DTYPE CARBONRADII2 = 1.7 * 1.7;
-const DTYPE A = KAPPA / CARBONRADII2;
+constexpr int D = 4;
+constexpr DTYPE PI = 3.14159265358;
+constexpr DTYPE KAPPA = 2.41798793102;
+constexpr DTYPE CARBONRADII2 = 1.7 * 1.7;
+constexpr DTYPE A = KAPPA / CARBONRADII2;
 const DTYPE CONSTANT = pow(PI / (2 * A), 1.5);
-const DTYPE EPSILON = 1E-9;
+constexpr DTYPE EPSILON = 1E-9;
 
 ////////////////////////////////////////////////////////////////////////////////
 /// For debug
