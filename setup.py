@@ -145,6 +145,9 @@ class CMakeBuild(build_ext):
 
 
 setup(
+    name="roshambo2",
+    version="0.1",
+    packages=["roshambo2"],
     ext_modules=[CMakeExtension("_roshambo2_cuda"), CMakeExtension("_roshambo2_cpp")],
     cmdclass={"build_ext": CMakeBuild},
     scripts=[
