@@ -111,33 +111,38 @@ class PheneShapeOverlay:
             n_gpus=n_gpus
         )
 
-    def _unbatch(self, batch_dict: Dict[str, torch.Tensor]) -> List[Dict[str, np.ndarray]]:
+    def _unbatch(self, batch_data) -> List[Dict[str, np.ndarray]]:
         """
-        Splits the flattened batch dictionary into a list of individual molecule dictionaries.
+        Splits the flattened PyG batch into a list of individual molecule dictionaries.
+        Arguments:
+            batch_data: Dictionary containing 'molecular_graph' (PyG Batch) and 'anchor_indices'.
         """
-        # Convert necessary tensors to numpy
-        # We need: graph_nodes, graph_pos, graph_batch
-        
-        # Check if on GPU or CPU
+        # Helper to get numpy
         def to_numpy(x):
-            return x.detach().cpu().numpy() if isinstance(x, torch.Tensor) else x
+            if hasattr(x, 'detach'):
+                return x.detach().cpu().numpy()
+            return x
 
-        nodes = to_numpy(batch_dict['graph_nodes'])
-        pos = to_numpy(batch_dict['graph_pos'])
-        batch_idx = to_numpy(batch_dict['graph_batch'])
+        # Extract Molecular Graph Object
+        # Supports dict access or attribute access
+        if isinstance(batch_data, dict):
+            mol_graph = batch_data['molecular_graph']
+        else:
+            mol_graph = batch_data.molecular_graph
+
+        # Extract Tensors from PyG Batch object
+        # (.x, .pos, .batch)
+        nodes = to_numpy(mol_graph.x)
+        pos = to_numpy(mol_graph.pos)
+        batch_idx = to_numpy(mol_graph.batch)
         
-        # Determine batch size from batch_idx max or metadata
-        batch_size = int(batch_idx.max()) + 1 if batch_idx.size > 0 else 0
-        if 'batch_size' in batch_dict:
-            batch_size = max(batch_size, batch_dict['batch_size'])
-            
-        # We can use a loop or numpy operations to split
-        # Since batch_idx is sorted (0,0,0,1,1,2,2...), we can find split points
-        # np.unique with return_counts is fast
+        # Split into list
+        # Since PyG batches are concatenated, batch_idx is monotonic (0,0...1,1...2,2...)
+        # We can use np.unique counts to split
         unique_ids, counts = np.unique(batch_idx, return_counts=True)
         
-        # However, some molecules might be missing if batch size > actual unique ids (empty mols?)
-        # PheneCollateFn ensures sequential 0..B-1
+        # Handle case where there might be gaps or empty graphs (unlikely in standard collation but possible)
+        # Assuming sequential 0..B-1
         
         split_indices = np.cumsum(counts)[:-1]
         
@@ -153,12 +158,12 @@ class PheneShapeOverlay:
             
         return mol_list
 
-    def calculate(self, batch_dict: Dict[str, Union[torch.Tensor, int]], mixing: float = 0.5) -> PheneOverlayBatchResult:
+    def calculate(self, batch_data, mixing: float = 0.5) -> PheneOverlayBatchResult:
         """
         Calculate overlap for all anchors against all candidates in the batch.
         
         Args:
-            batch_dict: Dictionary output from PheneCollateFn.
+            batch_data: Batch object/dict containing 'molecular_graph' and 'anchor_indices'.
             mixing: Color weight (0.0 to 1.0).
             
         Returns:
@@ -166,24 +171,26 @@ class PheneShapeOverlay:
         """
         
         # 1. Unbatch everything
-        mol_list = self._unbatch(batch_dict)
+        mol_list = self._unbatch(batch_data)
         batch_size = len(mol_list)
         
         if batch_size == 0:
              return PheneOverlayBatchResult(np.zeros((0,0,20)), 0, 0)
 
         # 2. Identify Anchors
-        anchor_indices = batch_dict.get('anchor_indices')
+        # Try item access then attribute access
+        if isinstance(batch_data, dict):
+            anchor_indices = batch_data.get('anchor_indices')
+        else:
+            anchor_indices = getattr(batch_data, 'anchor_indices', None)
+
         if anchor_indices is None:
-            # Fallback: Treat index 0 as anchor if no indices provided?
-            # Or raise error? Or maybe perform NxN?
-            # User workflow implies anchors exist.
-            # let's assume empty list if None
             anchor_indices = []
         else:
-            if isinstance(anchor_indices, torch.Tensor):
+            if hasattr(anchor_indices, 'detach'):
                 anchor_indices = anchor_indices.detach().cpu().numpy()
-            anchor_indices = anchor_indices.tolist()
+            if not isinstance(anchor_indices, list):
+                anchor_indices = anchor_indices.tolist()
 
         num_anchors = len(anchor_indices)
         if num_anchors == 0:
@@ -192,23 +199,11 @@ class PheneShapeOverlay:
 
         # 3. Prepare Candidates (All molecules)
         # We construct SimpleRoshamboData for the whole batch
-        # Note: We need to set filter_features=True (which is default now, but let's be explicit if we can)
-        # But SimpleRoshamboData takes a list of dicts.
-        
-        # We need to monkey-patch/inject the allow-list?
-        # Actually SimpleRoshamboData hardcodes the set allowed features currently inside minimal_cuda_backend.
-        # But wait, looking at my previous edit, I added ALLOWED_FEAT_IDXS inside __init__ but it was hardcoded.
-        # I should probably update SimpleRoshamboData to accept the set.
-        # For now, rely on the hardcoded set in minimal_cuda_backend or update it again if strictly needed.
-        # The default set [18..42] matches Phene features exactly (Charge, Aromatic, HB).
+        # Filter is handled by allowed_features in __init__
         
         candidates_data = SimpleRoshamboData(mol_list, name="BatchCandidates", allowed_features=self.allowed_features)
         
         # Allocate result tensor for (NumAnchors, BatchSize, 20)
-        # We can unfortunately not do it in one single call because Overlay supports 1 Query vs N Data.
-        # We have M Queries vs N Data.
-        # We Loop over M Queries.
-        
         all_scores = np.zeros((num_anchors, batch_size, 20), dtype=np.float32)
         
         for i, anchor_idx in enumerate(anchor_indices):
