@@ -200,26 +200,34 @@ class PheneShapeOverlay:
         # 3. Prepare Candidates (All molecules)
         # We construct SimpleRoshamboData for the whole batch
         # Filter is handled by allowed_features in __init__
-        
+
         candidates_data = SimpleRoshamboData(mol_list, name="BatchCandidates", allowed_features=self.allowed_features)
-        
-        # Allocate result tensor for (NumAnchors, BatchSize, 20)
-        all_scores = np.zeros((num_anchors, batch_size, 20), dtype=np.float32)
-        
-        for i, anchor_idx in enumerate(anchor_indices):
+
+        # 4. Prepare ALL anchor molecules as a single batched query
+        # This eliminates the Python for loop and leverages CUDA's batch processing
+        anchor_mols = []
+        valid_anchor_indices = []
+        for anchor_idx in anchor_indices:
             anchor_idx = int(anchor_idx)
-            if anchor_idx >= batch_size: continue
-            
-            # Extract single anchor molecule
-            anchor_mol = mol_list[anchor_idx]
-            query_data = SimpleRoshamboData(anchor_mol, name=f"Anchor_{anchor_idx}", allowed_features=self.allowed_features)
-            
-            # Run Overlay
-            # query_data: (1 iter)
-            # candidates_data: (N iter)
-            # Result: (1, N, 20)
-            scores = self.overlay.calculate_overlap_batch(query_data, candidates_data, mixing=mixing, color_generator=self.color_gen)
-            
-            all_scores[i] = scores[0]
-            
+            if anchor_idx < batch_size:
+                anchor_mols.append(mol_list[anchor_idx])
+                valid_anchor_indices.append(anchor_idx)
+
+        if len(anchor_mols) == 0:
+            return PheneOverlayBatchResult(np.zeros((num_anchors, batch_size, 20), dtype=np.float32), num_anchors, batch_size)
+
+        # Create batched query data for all anchors at once
+        query_data = SimpleRoshamboData(anchor_mols, name="Anchors", allowed_features=self.allowed_features)
+
+        # Single CUDA call for all anchors vs all candidates
+        # Result shape: (num_valid_anchors, batch_size, 20)
+        all_scores = self.overlay.calculate_overlap_batch(query_data, candidates_data, mixing=mixing, color_generator=self.color_gen)
+
+        # If some anchors were invalid, pad the result
+        if len(valid_anchor_indices) < num_anchors:
+            padded_scores = np.zeros((num_anchors, batch_size, 20), dtype=np.float32)
+            for i, _ in enumerate(valid_anchor_indices):
+                padded_scores[i] = all_scores[i]
+            all_scores = padded_scores
+
         return PheneOverlayBatchResult(all_scores, num_anchors, batch_size)
