@@ -84,29 +84,29 @@ public:
     std::vector<DeviceResources> resources;
     std::vector<int> device_ids;
 
-    CudaOverlapContext(int requested_gpus, int max_mols, int max_atoms, int n_features, int scores_dim) 
+    CudaOverlapContext(int requested_gpus, int max_mols, int max_atoms, int n_features, int scores_dim, int device_offset=0)
         : n_gpus(requested_gpus), max_mols(max_mols), max_atoms(max_atoms), n_features(n_features), scores_dim(scores_dim) {
-        
+
         int deviceCount = 0;
         CUDA_CHECK_ERROR(cudaGetDeviceCount(&deviceCount));
-        
-        if (deviceCount < requested_gpus) {
-             throw std::runtime_error("roshambo2.cuda: Error: "+std::to_string(requested_gpus)+" GPUs requested but "+std::to_string(deviceCount)+" GPUs found on machine!.");
+
+        if (deviceCount < requested_gpus + device_offset) {
+             throw std::runtime_error("roshambo2.cuda: Error: "+std::to_string(requested_gpus)+" GPUs requested with offset "+std::to_string(device_offset)+" but only "+std::to_string(deviceCount)+" GPUs found on machine!.");
         }
-        
+
         resources.resize(n_gpus);
         device_ids.resize(n_gpus);
-        
-        // Calculate max sizes per GPU (assuming we might split max_mols across GPUs if needed, 
-        // but for now we allocate full capacity buffers or split capacity? 
+
+        // Calculate max sizes per GPU (assuming we might split max_mols across GPUs if needed,
+        // but for now we allocate full capacity buffers or split capacity?
         // To be safe and simple: let's assume we split the BATCH across GPUs.
         // So each GPU needs to handle at most ceil(max_mols / n_gpus) molecules.
-        
+
         int mols_per_gpu = (max_mols + n_gpus - 1) / n_gpus;
-        
+
         #pragma omp parallel for num_threads(n_gpus)
         for(int k=0; k<n_gpus; ++k) {
-            int device_id = k % deviceCount;
+            int device_id = (k + device_offset) % deviceCount;
             device_ids[k] = device_id;
             
             CUDA_CHECK_ERROR(cudaSetDevice(device_id));
@@ -301,6 +301,6 @@ PYBIND11_MODULE(_roshambo2_cuda, m) {
     m.def("optimize_overlap_color", &optimize_overlap_color, "computes overlap of ref mol A with fit mols B");
     
     py::class_<CudaOverlapContext>(m, "CudaOverlapContext")
-        .def(py::init<int, int, int, int, int>(), py::arg("requested_gpus"), py::arg("max_mols"), py::arg("max_atoms"), py::arg("n_features"), py::arg("scores_dim"))
+        .def(py::init<int, int, int, int, int, int>(), py::arg("requested_gpus"), py::arg("max_mols"), py::arg("max_atoms"), py::arg("n_features"), py::arg("scores_dim"), py::arg("device_offset")=0)
         .def("optimize", &CudaOverlapContext::optimize, "Run optimization with persistent context");
 }

@@ -84,31 +84,32 @@ class PheneShapeOverlay:
     """
     
     def __init__(self, max_mols: int = 256, max_atoms: int = 300, n_gpus: int = 1,
+                 device_id: int = 0,
                  allowed_features: List[int] = [18, 19, 20, 21, 22, 36, 41, 42]):
         """
         Args:
             max_mols: Maximum batch size expected.
             max_atoms: Maximum atoms (nodes) per molecule expected.
-            n_gpus: Number of GPUs to use.
+            n_gpus: Number of GPUs to use for roshambo computation.
+            device_id: CUDA device ID to allocate on (for DDP, pass local GPU index).
             allowed_features: List of feature indices to use for color alignment.
                               Default is [Charge, Aromatic, HB Donor/Acceptor].
         """
         self.max_mols = max_mols
         self.max_atoms = max_atoms
         self.allowed_features = allowed_features
-        
+
         # Initialize Color Generator
         # Phene generator produces 48 dim features + padding -> 49
         self.color_gen = BitVectorColorGenerator(n_bits=48)
-        
-        # Initialize Persistent Context
-        # Note: minimal_cuda_backend handles the allowed_features filtering in SimpleRoshamboData
-        # We just need to ensure we initialize the context with the correct n_features (49)
+
+        # Initialize Persistent Context on the correct device
         self.overlay = PersistentCudaShapeOverlay(
-            max_mols=max_mols, 
-            max_atoms=max_atoms, 
-            n_features=self.color_gen.matrix_size, 
-            n_gpus=n_gpus
+            max_mols=max_mols,
+            max_atoms=max_atoms,
+            n_features=self.color_gen.matrix_size,
+            n_gpus=n_gpus,
+            device_id=device_id,
         )
 
     def _unbatch(self, batch_data) -> List[Dict[str, np.ndarray]]:

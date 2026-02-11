@@ -192,15 +192,15 @@ class PersistentCudaShapeOverlay:
     Wrapper around _roshambo2_cuda.CudaOverlapContext for training loops.
     Initializes GPU memory once and reuses it.
     """
-    def __init__(self, max_mols, max_atoms, n_features=48, n_gpus=1):
+    def __init__(self, max_mols, max_atoms, n_features=48, n_gpus=1, device_id=0):
         self.n_gpus = n_gpus
         self.max_mols = max_mols
         self.max_atoms = max_atoms
         self.n_features = n_features
         self.scores_dim = 20
-        
-        # Initialize Persistent Context
-        self.ctx = CudaOverlapContext(n_gpus, max_mols, max_atoms, n_features, self.scores_dim)
+
+        # Initialize Persistent Context on the correct GPU
+        self.ctx = CudaOverlapContext(n_gpus, max_mols, max_atoms, n_features, self.scores_dim, device_id)
         
         # Default optimizer settings
         self.lr_q = 0.1
