@@ -17,6 +17,9 @@ endif (BUILD_WITH_CUDA)
 # Find pybind
 find_package(pybind11)
 
+# Find PyTorch (libtorch) for torch::Tensor support in CUDA interface
+find_package(Torch REQUIRED)
+
 if (BUILD_WITH_CUDA)
     include_directories("${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}")
     # change here for newer or older cards
@@ -27,7 +30,8 @@ endif (BUILD_WITH_CUDA)
 pybind11_add_module(_roshambo2_cpp roshambo2/backends/cpp_src/cpp_functions.cpp roshambo2/backends/cpp_src/cpp_helper_functions.cpp)
 if (BUILD_WITH_CUDA)
     pybind11_add_module(_roshambo2_cuda roshambo2/backends/cuda_src/cuda_functions.cu roshambo2/backends/cuda_src/cuda_interface.cpp)
-    target_link_libraries(_roshambo2_cuda PRIVATE OpenMP::OpenMP_CXX)
+    target_link_libraries(_roshambo2_cuda PRIVATE OpenMP::OpenMP_CXX "${TORCH_LIBRARIES}")
+    target_include_directories(_roshambo2_cuda PRIVATE "${TORCH_INCLUDE_DIRS}")
 endif (BUILD_WITH_CUDA)
 
 target_link_libraries(_roshambo2_cpp PRIVATE OpenMP::OpenMP_CXX)

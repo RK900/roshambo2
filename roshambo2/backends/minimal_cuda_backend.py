@@ -3,6 +3,7 @@ import pickle
 import sys
 import os
 import time
+import torch
 
 # Try to import the cuda backend
 try:
@@ -237,12 +238,58 @@ class PersistentCudaShapeOverlay:
         
         # Run Optimization
         self.ctx.optimize(
-            query_data.f_x, query_data.f_types, query_data.f_n_real, 
-            data_data.f_x,       data_data.f_types,       data_data.f_n_real, 
-            im_r, 
-            im_p, 
-            scores, 
-            True, mixing, self.lr_q, self.lr_t, self.steps, 
+            query_data.f_x, query_data.f_types, query_data.f_n_real,
+            data_data.f_x,       data_data.f_types,       data_data.f_n_real,
+            im_r,
+            im_p,
+            scores,
+            True, mixing, self.lr_q, self.lr_t, self.steps,
+            start_mode, self.verbosity
+        )
+        return scores
+
+    def calculate_overlap_batch_torch(self, query_f_x, query_f_types, query_f_n_real,
+                                       data_f_x, data_f_types, data_f_n_real,
+                                       color_generator, start_mode=1, mixing=0.5):
+        """
+        Zero-copy torch::Tensor path. All inputs should be CUDA tensors on the correct device.
+        Passes data_ptrs directly to CUDA kernel, avoiding CPU<->GPU copies.
+
+        Args:
+            query_f_x: (n_queries, max_atoms, 4) float32 CUDA tensor
+            query_f_types: (n_queries, max_atoms) int32 CUDA tensor
+            query_f_n_real: (n_queries,) int32 tensor (CPU or CUDA)
+            data_f_x: (n_mols, max_atoms, 4) float32 CUDA tensor
+            data_f_types: (n_mols, max_atoms) int32 CUDA tensor
+            data_f_n_real: (n_mols,) int32 tensor (CPU or CUDA)
+            color_generator: BitVectorColorGenerator with interaction matrices
+            start_mode: Starting mode for optimization
+            mixing: Color weight (0.0 to 1.0)
+
+        Returns:
+            scores: (n_queries, n_mols, 20) float32 CUDA tensor
+        """
+        n_q = query_f_x.shape[0]
+        n_d = data_f_x.shape[0]
+        device = data_f_x.device
+
+        # Interaction matrices as float32 tensors on the same device
+        im_r = torch.from_numpy(
+            np.ascontiguousarray(color_generator.interaction_matrix_r, dtype=np.float32)
+        ).to(device)
+        im_p = torch.from_numpy(
+            np.ascontiguousarray(color_generator.interaction_matrix_p, dtype=np.float32)
+        ).to(device)
+
+        # Allocate output scores on GPU
+        scores = torch.zeros((n_q, n_d, self.scores_dim), dtype=torch.float32, device=device)
+
+        # Call the zero-copy C++ method
+        self.ctx.optimize_torch(
+            query_f_x.contiguous(), query_f_types.contiguous().int(), query_f_n_real.contiguous().int(),
+            data_f_x.contiguous(), data_f_types.contiguous().int(), data_f_n_real.contiguous().int(),
+            im_r, im_p, scores,
+            True, mixing, self.lr_q, self.lr_t, self.steps,
             start_mode, self.verbosity
         )
         return scores

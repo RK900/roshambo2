@@ -42,6 +42,12 @@ def _pybind11_cmake_dir() -> str:
         return out.decode().strip()
 
 
+def _torch_cmake_dir() -> str:
+    """Return the directory containing PyTorch's CMake config files."""
+    import torch
+    return os.path.join(torch.utils.cmake_prefix_path, "Torch")
+
+
 class CMakeBuild(build_ext):
     def build_extension(self, ext: CMakeExtension) -> None:
         # Must be in this form due to bug in .resolve() only fixed in Python 3.10+
@@ -68,6 +74,8 @@ class CMakeBuild(build_ext):
             f"-DEXAMPLE_VERSION_INFO={self.distribution.get_version()}",
             # Point CMake at pybind11's CMake config (fixes build isolation discovery)
             f"-Dpybind11_DIR={_pybind11_cmake_dir()}",
+            # Point CMake at PyTorch's CMake config for libtorch linking
+            f"-DTorch_DIR={_torch_cmake_dir()}",
         ]
         build_args = []
         # Adding CMake arguments set as environment variable
@@ -134,7 +142,8 @@ class CMakeBuild(build_ext):
         # Ensure CMake can also discover via prefix path
         env = os.environ.copy()
         p11 = _pybind11_cmake_dir()
-        env["CMAKE_PREFIX_PATH"] = p11 + os.pathsep + env.get("CMAKE_PREFIX_PATH", "")
+        torch_prefix = _torch_cmake_dir()
+        env["CMAKE_PREFIX_PATH"] = p11 + os.pathsep + torch_prefix + os.pathsep + env.get("CMAKE_PREFIX_PATH", "")
 
         subprocess.run(
             ["cmake", ext.sourcedir, *cmake_args], cwd=build_temp, check=True, env=env

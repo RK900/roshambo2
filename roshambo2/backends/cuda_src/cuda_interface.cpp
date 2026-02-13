@@ -20,6 +20,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
+#include <torch/extension.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <iostream>
@@ -269,6 +270,160 @@ public:
         }
     }
 
+    // Zero-copy torch::Tensor path - avoids CPU<->GPU round-trips entirely
+    // When all tensors are already on the correct CUDA device, passes data_ptrs
+    // directly to the kernel with no memory copies for input data.
+    // Falls back to device-to-device copies for multi-GPU or cross-device cases.
+    void optimize_torch(torch::Tensor A, torch::Tensor AT, torch::Tensor AN,
+                        torch::Tensor B, torch::Tensor BT, torch::Tensor BN,
+                        torch::Tensor RMAT, torch::Tensor PMAT, torch::Tensor V,
+                        bool optim_color, float mixing_param, float lr_q, float lr_t, int nsteps,
+                        int start_mode_method, int loglevel) {
+
+        TORCH_CHECK(A.dim() == 3, "A must be 3D (n_queries, max_atoms, 4)");
+        TORCH_CHECK(B.dim() == 3, "B must be 3D (n_mols, max_atoms, 4)");
+        TORCH_CHECK(V.dim() == 3, "V must be 3D (n_queries, n_mols, scores_dim)");
+
+        A = A.contiguous().to(torch::kFloat32);
+        B = B.contiguous().to(torch::kFloat32);
+        AT = AT.contiguous().to(torch::kInt32);
+        BT = BT.contiguous().to(torch::kInt32);
+        RMAT = RMAT.contiguous().to(torch::kFloat32);
+        PMAT = PMAT.contiguous().to(torch::kFloat32);
+
+        // AN/BN are small (one int per molecule) - move to CPU for host-side access
+        auto AN_cpu = AN.to(torch::kCPU).contiguous().to(torch::kInt32);
+        auto BN_cpu = BN.to(torch::kCPU).contiguous().to(torch::kInt32);
+
+        long current_n_mols = B.size(0);
+        long current_mol_atoms = B.size(1);
+        long query_mol_atoms = A.size(1);
+
+        if (current_n_mols > max_mols) {
+            throw std::runtime_error("Batch size " + std::to_string(current_n_mols) +
+                                     " exceeds max_mols " + std::to_string(max_mols));
+        }
+
+        // Single-GPU zero-copy fast path (common case in DDP training)
+        if (n_gpus == 1) {
+            int device_id = device_ids[0];
+            CUDA_CHECK_ERROR(cudaSetDevice(device_id));
+
+            auto target_device = torch::Device(torch::kCUDA, device_id);
+            bool all_on_device = A.is_cuda() && A.device().index() == device_id &&
+                                 B.is_cuda() && B.device().index() == device_id;
+
+            if (all_on_device) {
+                // Ensure interaction matrices and BN are on device
+                auto rmat_d = RMAT.to(target_device).contiguous();
+                auto pmat_d = PMAT.to(target_device).contiguous();
+                auto BN_d = BN.to(target_device).contiguous().to(torch::kInt32);
+
+                // Ensure output tensor is on device
+                TORCH_CHECK(V.is_cuda() && V.device().index() == device_id,
+                            "Output tensor V must be on CUDA device " + std::to_string(device_id));
+
+                // Loop over queries - pass tensor data_ptrs directly to kernel
+                for (int64_t i = 0; i < A.size(0); ++i) {
+                    int molA_atoms_i = AN_cpu.data_ptr<int>()[i];
+
+                    optimize_overlap_gpu(
+                        A.data_ptr<float>() + i * query_mol_atoms * 4,
+                        AT.data_ptr<int>() + i * query_mol_atoms,
+                        molA_atoms_i,
+                        (int)query_mol_atoms,
+                        B.data_ptr<float>(),
+                        BT.data_ptr<int>(),
+                        BN_d.data_ptr<int>(),
+                        (int)current_mol_atoms,
+                        current_n_mols,
+                        rmat_d.data_ptr<float>(),
+                        pmat_d.data_ptr<float>(),
+                        n_features,
+                        V.data_ptr<float>() + i * V.size(1) * V.size(2),
+                        optim_color, lr_q, lr_t, nsteps, mixing_param,
+                        start_mode_method, device_id
+                    );
+                }
+                return;
+            }
+        }
+
+        // Fallback: multi-GPU or cross-device — copy to pre-allocated buffers
+        int base_len = current_n_mols / n_gpus;
+        int remainder = current_n_mols % n_gpus;
+
+        std::vector<int> start_index(n_gpus), chunk_size(n_gpus);
+        int l = 0;
+        for (int k = 0; k < n_gpus; ++k) {
+            start_index[k] = l;
+            chunk_size[k] = base_len + (k == 0 ? remainder : 0);
+            l += chunk_size[k];
+        }
+
+        for (int64_t i = 0; i < A.size(0); ++i) {
+            #pragma omp parallel for num_threads(n_gpus)
+            for (int k = 0; k < n_gpus; ++k) {
+                if (chunk_size[k] == 0) continue;
+
+                int device_id = device_ids[k];
+                CUDA_CHECK_ERROR(cudaSetDevice(device_id));
+                DeviceResources &res = resources[k];
+
+                // Determine copy kind based on source tensor location
+                cudaMemcpyKind input_copy = A.is_cuda() ? cudaMemcpyDeviceToDevice : cudaMemcpyHostToDevice;
+                cudaMemcpyKind rmat_copy = RMAT.is_cuda() ? cudaMemcpyDeviceToDevice : cudaMemcpyHostToDevice;
+
+                // Copy Query Mol A
+                long molA_copy_size = query_mol_atoms * 4 * sizeof(float);
+                CUDA_CHECK_ERROR(cudaMemcpy(res.molA_device,
+                    A.data_ptr<float>() + i * query_mol_atoms * 4,
+                    molA_copy_size, input_copy));
+
+                long molA_type_copy_size = query_mol_atoms * sizeof(int);
+                CUDA_CHECK_ERROR(cudaMemcpy(res.molA_type_device,
+                    AT.data_ptr<int>() + i * query_mol_atoms,
+                    molA_type_copy_size, input_copy));
+
+                int molA_atoms_i = AN_cpu.data_ptr<int>()[i];
+
+                // Copy Interaction Matrices
+                CUDA_CHECK_ERROR(cudaMemcpy(res.rmat_device, RMAT.data_ptr<float>(), res.rmat_size, rmat_copy));
+                CUDA_CHECK_ERROR(cudaMemcpy(res.pmat_device, PMAT.data_ptr<float>(), res.pmat_size, rmat_copy));
+
+                // Copy Batch Data Mol B chunk
+                int s_idx = start_index[k];
+                int c_size = chunk_size[k];
+
+                const float *ptr_molB = B.data_ptr<float>() + (long)s_idx * current_mol_atoms * 4;
+                long molB_copy_size = (long)c_size * current_mol_atoms * 4 * sizeof(float);
+                CUDA_CHECK_ERROR(cudaMemcpy(res.molBs_device, ptr_molB, molB_copy_size, input_copy));
+
+                const int *ptr_molB_type = BT.data_ptr<int>() + (long)s_idx * current_mol_atoms;
+                long molB_type_copy_size = (long)c_size * current_mol_atoms * sizeof(int);
+                CUDA_CHECK_ERROR(cudaMemcpy(res.molB_type_device, ptr_molB_type, molB_type_copy_size, input_copy));
+
+                const int *ptr_molB_num = BN_cpu.data_ptr<int>() + s_idx;
+                long molB_num_copy_size = c_size * sizeof(int);
+                CUDA_CHECK_ERROR(cudaMemcpy(res.molB_num_atoms_device, ptr_molB_num, molB_num_copy_size, cudaMemcpyHostToDevice));
+
+                // Run Kernel
+                optimize_overlap_gpu(
+                    res.molA_device, res.molA_type_device, molA_atoms_i, (int)current_mol_atoms,
+                    res.molBs_device, res.molB_type_device, res.molB_num_atoms_device, (int)current_mol_atoms, c_size,
+                    res.rmat_device, res.pmat_device, n_features, res.scores_device,
+                    optim_color, lr_q, lr_t, nsteps, mixing_param, start_mode_method, device_id
+                );
+
+                // Copy Scores to output tensor
+                cudaMemcpyKind scores_copy = V.is_cuda() ? cudaMemcpyDeviceToDevice : cudaMemcpyDeviceToHost;
+                float *scores_out = V.data_ptr<float>() + i * V.size(1) * V.size(2) + (long)s_idx * scores_dim;
+                long scores_copy_size = (long)c_size * scores_dim * sizeof(float);
+                CUDA_CHECK_ERROR(cudaMemcpy(scores_out, res.scores_device, scores_copy_size, scores_copy));
+            }
+        }
+    }
+
 };
 
 
@@ -297,10 +452,11 @@ void optimize_overlap_color(py::array_t<float> A, py::array_t<int> AT, py::array
 }
 
 
-PYBIND11_MODULE(_roshambo2_cuda, m) { 
+PYBIND11_MODULE(_roshambo2_cuda, m) {
     m.def("optimize_overlap_color", &optimize_overlap_color, "computes overlap of ref mol A with fit mols B");
-    
+
     py::class_<CudaOverlapContext>(m, "CudaOverlapContext")
         .def(py::init<int, int, int, int, int, int>(), py::arg("requested_gpus"), py::arg("max_mols"), py::arg("max_atoms"), py::arg("n_features"), py::arg("scores_dim"), py::arg("device_offset")=0)
-        .def("optimize", &CudaOverlapContext::optimize, "Run optimization with persistent context");
+        .def("optimize", &CudaOverlapContext::optimize, "Run optimization with persistent context")
+        .def("optimize_torch", &CudaOverlapContext::optimize_torch, "Run optimization with torch::Tensor zero-copy path");
 }
