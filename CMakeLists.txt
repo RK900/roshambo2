@@ -1,6 +1,11 @@
 cmake_minimum_required(VERSION 3.18)
 option(BUILD_WITH_CUDA "Build the CUDA functionaility" ON)
 
+# Must be set before project() so CMake can detect the CUDA compiler
+if (NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES native)
+endif()
+
 if (BUILD_WITH_CUDA)
     project(_roshambo2 LANGUAGES CXX CUDA)
 else (BUILD_WITH_CUDA)
@@ -22,8 +27,6 @@ find_package(Torch REQUIRED)
 
 if (BUILD_WITH_CUDA)
     include_directories("${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}")
-    # change here for newer or older cards
-    set(CMAKE_CUDA_ARCHITECTURES native)
 endif (BUILD_WITH_CUDA)
 
 # TODO: optional GPU build
