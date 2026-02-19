@@ -33,7 +33,7 @@ endif (BUILD_WITH_CUDA)
 pybind11_add_module(_roshambo2_cpp roshambo2/backends/cpp_src/cpp_functions.cpp roshambo2/backends/cpp_src/cpp_helper_functions.cpp)
 if (BUILD_WITH_CUDA)
     pybind11_add_module(_roshambo2_cuda roshambo2/backends/cuda_src/cuda_functions.cu roshambo2/backends/cuda_src/cuda_interface.cpp)
-    target_link_libraries(_roshambo2_cuda PRIVATE OpenMP::OpenMP_CXX "${TORCH_LIBRARIES}")
+    target_link_libraries(_roshambo2_cuda PRIVATE OpenMP::OpenMP_CXX "${TORCH_LIBRARIES}" torch_python)
     target_include_directories(_roshambo2_cuda PRIVATE "${TORCH_INCLUDE_DIRS}")
 endif (BUILD_WITH_CUDA)
 
