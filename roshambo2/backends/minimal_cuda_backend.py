@@ -158,7 +158,7 @@ class MinimalCudaShapeOverlay:
         
         self.lr_q = 0.1
         self.lr_t = 0.1
-        self.steps = 100
+        self.steps = 50
 
         n_q = len(self.query_data.f_names)
         n_d = len(self.data.f_names)
@@ -206,7 +206,7 @@ class PersistentCudaShapeOverlay:
         # Default optimizer settings
         self.lr_q = 0.1
         self.lr_t = 0.1
-        self.steps = 100
+        self.steps = 50
         self.verbosity = 0
 
     def calculate_overlap_batch(self, query_data, data_data, start_mode=1, mixing=0.5, color_generator=None):
