@@ -624,7 +624,7 @@ __global__ void optimize(const float * molA_global, const int * molA_type_global
             volume_single(molB, molB_type, molB_num_atom, NmolB,
                         molB, molB_type, molB_num_atom, NmolB,
                         rmat, pmat, N_features, vb);
-            
+
 
             #ifdef DEBUG
             printf("idx: %d\n", idx);
@@ -696,7 +696,7 @@ __global__ void optimize(const float * molA_global, const int * molA_type_global
 
                 
                 //normalize q
-                float magq = sqrt(q[0]*q[0] + q[1]*q[1] + q[2]*q[2] * q[3]*q[3]);
+                float magq = sqrt(q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3]);
 
                 // std::cout << magq << std::endl;
                 q[0] = q[0]/magq;
@@ -708,13 +708,13 @@ __global__ void optimize(const float * molA_global, const int * molA_type_global
             // final step to get latest volumes
             // get_gradient computes the volumes, we dont care about the gradients it returns
             float temp[7]   = {0.0,0.0,0.0,0.0,0.0,0.0,0.0};
-            get_gradient(molA, molA_type, molA_num_atoms_i, NmolA, 
-                            molB, molB_type, molB_num_atom, NmolB, 
+            get_gradient(molA, molA_type, molA_num_atoms_i, NmolA,
+                            molB, molB_type, molB_num_atom, NmolB,
                             rmat, pmat, N_features,
                             temp,temp, q, t, vs);
 
 
-            
+
             // compute tamimoto scores
 
             // shape
@@ -767,18 +767,18 @@ __global__ void optimize(const float * molA_global, const int * molA_type_global
                 #endif
             }
 
-        
 
-        scores[idx*DV]    = scores_register[0];   
-        scores[idx*DV+1]  = scores_register[1]; 
-        scores[idx*DV+2]  = scores_register[2]; 
-        scores[idx*DV+3]  = scores_register[3]; 
-        scores[idx*DV+4]  = scores_register[4]; 
-        scores[idx*DV+5]  = scores_register[5]; 
-        scores[idx*DV+6]  = scores_register[6]; 
-        scores[idx*DV+7]  = scores_register[7]; 
-        scores[idx*DV+8]  = scores_register[8]; 
-        scores[idx*DV+9]  = scores_register[9]; 
+
+        scores[idx*DV]    = scores_register[0];
+        scores[idx*DV+1]  = scores_register[1];
+        scores[idx*DV+2]  = scores_register[2];
+        scores[idx*DV+3]  = scores_register[3];
+        scores[idx*DV+4]  = scores_register[4];
+        scores[idx*DV+5]  = scores_register[5];
+        scores[idx*DV+6]  = scores_register[6];
+        scores[idx*DV+7]  = scores_register[7];
+        scores[idx*DV+8]  = scores_register[8];
+        scores[idx*DV+9]  = scores_register[9];
         scores[idx*DV+10] = scores_register[10];
         scores[idx*DV+11] = scores_register[11];
         scores[idx*DV+12] = scores_register[12];
@@ -930,7 +930,7 @@ __global__ void optimize_batched(
                     adagrad_step(q,t,g, cache, lr_q, lr_t);
                 }
 
-                float magq = sqrt(q[0]*q[0] + q[1]*q[1] + q[2]*q[2] * q[3]*q[3]);
+                float magq = sqrt(q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3]);
                 q[0] = q[0]/magq;
                 q[1] = q[1]/magq;
                 q[2] = q[2]/magq;

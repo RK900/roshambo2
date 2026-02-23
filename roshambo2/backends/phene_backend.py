@@ -155,6 +155,9 @@ class PheneShapeOverlay:
         GPU-native feature expansion. Replaces _unbatch + SimpleRoshamboData.
         Converts a PyG Batch into padded (B, max_atoms, 4) tensors entirely on GPU.
 
+        Includes COM centering and PCA alignment to match the original Roshambo2
+        molecule preparation pipeline (Roshambo2Mol.__init__).
+
         Args:
             mol_graph: PyG Batch with .x (N_total, 48), .pos (N_total, 3), .batch (N_total,)
 
@@ -169,12 +172,30 @@ class PheneShapeOverlay:
         batch_idx = mol_graph.batch  # (N_total,)
         device = x.device
 
+        # --- Remove H atoms (bit 0 of feature vector = H atom type) ---
+        # Original Roshambo2 always removes Hs for shape calculations (classes.py:45,62)
+        heavy_mask = x[:, 0] < 0.5  # bit 0 = H atom type; keep non-H atoms
+        x = x[heavy_mask]
+        pos = pos[heavy_mask]
+        batch_idx = batch_idx[heavy_mask]
+
         num_graphs = int(batch_idx.max().item()) + 1
         allowed = self._get_allowed_tensor(device)
 
-        # Count real atoms per molecule
+        # Count real (heavy) atoms per molecule
         n_real = torch.zeros(num_graphs, device=device, dtype=torch.int32)
         n_real.scatter_add_(0, batch_idx.long(), torch.ones(batch_idx.shape[0], device=device, dtype=torch.int32))
+
+        # --- COM centering (required for CUDA optimizer convergence) ---
+        # The optimizer starts with zero translation, so molecules must be centered
+        # at origin for the initial overlap to be meaningful.
+        batch_idx_long = batch_idx.long()
+        counts = torch.zeros(num_graphs, 1, device=device, dtype=pos.dtype)
+        counts.scatter_add_(0, batch_idx_long.unsqueeze(1), torch.ones(pos.shape[0], 1, device=device, dtype=pos.dtype))
+        sum_pos = torch.zeros(num_graphs, 3, device=device, dtype=pos.dtype)
+        sum_pos.scatter_add_(0, batch_idx_long.unsqueeze(1).expand(-1, 3), pos)
+        centroids = sum_pos / counts
+        pos = pos - centroids[batch_idx_long]
 
         # Feature expansion: find active (> 0.5) features in allowed columns
         feat_vals = x[:, allowed]  # (N_total, n_allowed)
