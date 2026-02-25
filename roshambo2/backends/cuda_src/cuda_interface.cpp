@@ -318,33 +318,33 @@ public:
                 auto rmat_d = RMAT.to(target_device).contiguous();
                 auto pmat_d = PMAT.to(target_device).contiguous();
                 auto BN_d = BN.to(target_device).contiguous().to(torch::kInt32);
+                auto AN_d = AN.to(target_device).contiguous().to(torch::kInt32);
 
                 // Ensure output tensor is on device
                 TORCH_CHECK(V.is_cuda() && V.device().index() == device_id,
                             "Output tensor V must be on CUDA device " + std::to_string(device_id));
 
-                // Loop over queries - pass tensor data_ptrs directly to kernel
-                for (int64_t i = 0; i < A.size(0); ++i) {
-                    int molA_atoms_i = AN_cpu.data_ptr<int>()[i];
+                int64_t n_queries = A.size(0);
 
-                    optimize_overlap_gpu(
-                        A.data_ptr<float>() + i * query_mol_atoms * 4,
-                        AT.data_ptr<int>() + i * query_mol_atoms,
-                        molA_atoms_i,
-                        (int)query_mol_atoms,
-                        B.data_ptr<float>(),
-                        BT.data_ptr<int>(),
-                        BN_d.data_ptr<int>(),
-                        (int)current_mol_atoms,
-                        current_n_mols,
-                        rmat_d.data_ptr<float>(),
-                        pmat_d.data_ptr<float>(),
-                        n_features,
-                        V.data_ptr<float>() + i * V.size(1) * V.size(2),
-                        optim_color, lr_q, lr_t, nsteps, mixing_param,
-                        start_mode_method, device_id
-                    );
-                }
+                // Single batched kernel launch for all queries — one launch, one sync
+                optimize_overlap_gpu_batched(
+                    A.data_ptr<float>(),
+                    AT.data_ptr<int>(),
+                    AN_d.data_ptr<int>(),
+                    (int)query_mol_atoms,
+                    (int)n_queries,
+                    B.data_ptr<float>(),
+                    BT.data_ptr<int>(),
+                    BN_d.data_ptr<int>(),
+                    (int)current_mol_atoms,
+                    current_n_mols,
+                    rmat_d.data_ptr<float>(),
+                    pmat_d.data_ptr<float>(),
+                    n_features,
+                    V.data_ptr<float>(),
+                    optim_color, lr_q, lr_t, nsteps, mixing_param,
+                    start_mode_method, device_id
+                );
                 return;
             }
         }

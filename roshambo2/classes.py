@@ -87,20 +87,15 @@ class Roshambo2Mol:
         # get the coordinates
         r = np.array(mol.GetConformer().GetPositions(), dtype=np.float32)
 
-        # centre and align
-        # important: the COM and PCA are calculated ignoring Hs
-        
+        # centre only (skip PCA — data is already globally aligned)
+        # important: the COM is calculated ignoring Hs
+
         centroid = np.mean(self.original_coords, axis=0)
         r = r-centroid # center
 
-        cvm = np.cov(self.original_coords, rowvar=False)
-        _,_,v = np.linalg.svd(cvm)
-        r = np.dot(r, v.T) # align to principal axis
-
-        # center and align the color dummy atoms
+        # center the color dummy atoms
         if self.has_color:
             self.color_coords = self.original_color_coords - centroid
-            self.color_coords = np.dot(self.color_coords, v.T) 
 
         # update the coords of the rdkit mol
         conf = mol.GetConformer()

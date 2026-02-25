@@ -68,33 +68,42 @@ class SimpleRoshamboData:
             nodes = mol_dict['graph_nodes']
             if hasattr(nodes, 'numpy'): nodes = nodes.numpy()
             else: nodes = np.array(nodes)
-            
+
             pos = mol_dict['graph_pos']
             if hasattr(pos, 'numpy'): pos = pos.numpy()
             else: pos = np.array(pos)
-            
+
+            # Remove H atoms (bit 0 of feature vector = H atom type)
+            # Matches _prepare_batch_torch which filters H before processing
+            heavy_mask = nodes[:, 0] < 0.5
+            nodes = nodes[heavy_mask]
+            pos = pos[heavy_mask]
+
+            # COM centering (matches _prepare_batch_torch)
+            centroid = pos.mean(axis=0)
+            pos = pos - centroid
+
             # Feature extraction
-            # Revert to int (int64) to match roshambo2/utils.py
             n_real = pos.shape[0]
-            
+
             # Feature Atoms
             active_rows, active_cols = np.where(nodes > 0.5)
-            
+
             # Filter features
             if self.allowed_features:
                 mask = np.isin(active_cols, list(self.allowed_features))
                 active_rows = active_rows[mask]
                 active_cols = active_cols[mask]
-            
+
             coords_list = [pos]
             types_list = [np.zeros(n_real, dtype=int)] # Real atoms = Type 0
-            
+
             if len(active_rows) > 0:
                 feat_coords = pos[active_rows]
                 feat_types = active_cols + 1 # 1-based indexing for features
                 coords_list.append(feat_coords)
                 types_list.append(feat_types.astype(int))
-                
+
             all_coords = np.concatenate(coords_list, axis=0)
             all_types = np.concatenate(types_list, axis=0)
             
@@ -158,7 +167,7 @@ class MinimalCudaShapeOverlay:
         
         self.lr_q = 0.1
         self.lr_t = 0.1
-        self.steps = 100
+        self.steps = 50
 
         n_q = len(self.query_data.f_names)
         n_d = len(self.data.f_names)
@@ -193,7 +202,7 @@ class PersistentCudaShapeOverlay:
     Wrapper around _roshambo2_cuda.CudaOverlapContext for training loops.
     Initializes GPU memory once and reuses it.
     """
-    def __init__(self, max_mols, max_atoms, n_features=48, n_gpus=1, device_id=0):
+    def __init__(self, max_mols, max_atoms, n_features=49, n_gpus=1, device_id=0):
         self.n_gpus = n_gpus
         self.max_mols = max_mols
         self.max_atoms = max_atoms
@@ -206,7 +215,7 @@ class PersistentCudaShapeOverlay:
         # Default optimizer settings
         self.lr_q = 0.1
         self.lr_t = 0.1
-        self.steps = 100
+        self.steps = 50
         self.verbosity = 0
 
     def calculate_overlap_batch(self, query_data, data_data, start_mode=1, mixing=0.5, color_generator=None):

@@ -624,7 +624,7 @@ __global__ void optimize(const float * molA_global, const int * molA_type_global
             volume_single(molB, molB_type, molB_num_atom, NmolB,
                         molB, molB_type, molB_num_atom, NmolB,
                         rmat, pmat, N_features, vb);
-            
+
 
             #ifdef DEBUG
             printf("idx: %d\n", idx);
@@ -696,7 +696,7 @@ __global__ void optimize(const float * molA_global, const int * molA_type_global
 
                 
                 //normalize q
-                float magq = sqrt(q[0]*q[0] + q[1]*q[1] + q[2]*q[2] * q[3]*q[3]);
+                float magq = sqrt(q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3]);
 
                 // std::cout << magq << std::endl;
                 q[0] = q[0]/magq;
@@ -708,13 +708,13 @@ __global__ void optimize(const float * molA_global, const int * molA_type_global
             // final step to get latest volumes
             // get_gradient computes the volumes, we dont care about the gradients it returns
             float temp[7]   = {0.0,0.0,0.0,0.0,0.0,0.0,0.0};
-            get_gradient(molA, molA_type, molA_num_atoms_i, NmolA, 
-                            molB, molB_type, molB_num_atom, NmolB, 
+            get_gradient(molA, molA_type, molA_num_atoms_i, NmolA,
+                            molB, molB_type, molB_num_atom, NmolB,
                             rmat, pmat, N_features,
                             temp,temp, q, t, vs);
 
 
-            
+
             // compute tamimoto scores
 
             // shape
@@ -767,18 +767,18 @@ __global__ void optimize(const float * molA_global, const int * molA_type_global
                 #endif
             }
 
-        
 
-        scores[idx*DV]    = scores_register[0];   
-        scores[idx*DV+1]  = scores_register[1]; 
-        scores[idx*DV+2]  = scores_register[2]; 
-        scores[idx*DV+3]  = scores_register[3]; 
-        scores[idx*DV+4]  = scores_register[4]; 
-        scores[idx*DV+5]  = scores_register[5]; 
-        scores[idx*DV+6]  = scores_register[6]; 
-        scores[idx*DV+7]  = scores_register[7]; 
-        scores[idx*DV+8]  = scores_register[8]; 
-        scores[idx*DV+9]  = scores_register[9]; 
+
+        scores[idx*DV]    = scores_register[0];
+        scores[idx*DV+1]  = scores_register[1];
+        scores[idx*DV+2]  = scores_register[2];
+        scores[idx*DV+3]  = scores_register[3];
+        scores[idx*DV+4]  = scores_register[4];
+        scores[idx*DV+5]  = scores_register[5];
+        scores[idx*DV+6]  = scores_register[6];
+        scores[idx*DV+7]  = scores_register[7];
+        scores[idx*DV+8]  = scores_register[8];
+        scores[idx*DV+9]  = scores_register[9];
         scores[idx*DV+10] = scores_register[10];
         scores[idx*DV+11] = scores_register[11];
         scores[idx*DV+12] = scores_register[12];
@@ -799,6 +799,237 @@ __global__ void optimize(const float * molA_global, const int * molA_type_global
 
 
 
+
+
+// Batched optimization kernel: all queries launched in a single kernel.
+// blockIdx.x encodes (query_idx, data_block): query_idx = blockIdx.x / blocks_per_batch,
+// data_block = blockIdx.x % blocks_per_batch. Each block loads one query's molA into shared memory.
+__global__ void optimize_batched(
+    const float * molAs_global,         // (n_queries, NmolA, 4) - all query molecules packed
+    const int   * molAs_type_global,    // (n_queries, NmolA)
+    const int   * molA_num_atoms_arr,   // (n_queries,) - real atom count per query
+    int NmolA,
+    const float * molBs,       const int * molB_types,       const int * molB_num_atoms, int NmolB,
+    const float * rmat_global, const float * pmat_global, int N_features,
+    float * scores,            // (n_queries, Nv, DV)
+    int Nv, int blocks_per_batch, int n_queries,
+    bool optim_color, float lr_q, float lr_t, int nsteps, float mixing_param, int start_mode){
+
+    // Decode block index into query and data-molecule block
+    int query_idx  = blockIdx.x / blocks_per_batch;
+    int data_block = blockIdx.x % blocks_per_batch;
+
+    if (query_idx >= n_queries) return;
+
+    size_t idx = data_block * blockDim.x + threadIdx.x; // data molecule index
+
+    const int DV = 20;
+
+    // Shared memory layout (same as original kernel)
+    extern __shared__ float shared[];
+    float * molA      = shared;
+    float * qr        = (float *)&shared[NmolA*D];
+    float * rmat      = (float *)&shared[NmolA*D+8];
+    float * pmat      = (float *)&shared[NmolA*D+8+N_features*N_features];
+    int   * molA_type = (int   *)&shared[NmolA*D+8+2*N_features*N_features];
+
+    size_t tidx = threadIdx.x;
+
+    // Pointer to this query's data in the packed arrays
+    const float * my_molA_global = molAs_global + (long)query_idx * NmolA * D;
+    const int   * my_molA_type_global = molAs_type_global + (long)query_idx * NmolA;
+    int molA_num_atoms_i = molA_num_atoms_arr[query_idx];
+
+    // Copy molA_type to shared memory
+    if (tidx < NmolA){
+        for(int l=tidx; l<NmolA; l+=blockDim.x){
+            molA_type[l] = my_molA_type_global[l];
+        }
+    }
+
+    // Copy interaction matrices to shared memory
+    if (tidx < (N_features*N_features)){
+        for(int l=tidx; l<(N_features*N_features); l+=blockDim.x){
+            rmat[l] = rmat_global[l];
+            pmat[l] = pmat_global[l];
+        }
+    }
+
+    __syncthreads();
+
+    // Start mode loop
+    int N_starts = start_mode_n[start_mode];
+
+    float scores_register[20];
+    for(int j=0;j<20;++j){
+        scores_register[j]=0.0f;
+    }
+
+    for(int n=0; n<N_starts; n++){
+        if (tidx==0){
+            start_mode_transform(my_molA_global, molA, qr, NmolA, start_mode, n);
+        }
+        __syncthreads();
+
+        if (idx < Nv){
+            const float * molB = &molBs[idx*NmolB*D];
+            const int * molB_type = &molB_types[idx*NmolB];
+            int molB_num_atom = molB_num_atoms[idx];
+
+            float va[2];
+            float vb[2];
+
+            volume_single(molA, molA_type, molA_num_atoms_i, NmolA,
+                        molA, molA_type, molA_num_atoms_i, NmolA,
+                        rmat, pmat, N_features, va);
+
+            volume_single(molB, molB_type, molB_num_atom, NmolB,
+                        molB, molB_type, molB_num_atom, NmolB,
+                        rmat, pmat, N_features, vb);
+
+            float q[4] = {1.0,0.0,0.0,0.0};
+            float t[3] = {0.0,0.0,0.0};
+
+            float vs[2] = {0.0,0.0};
+            float cache[7] = {0.0,0.0,0.0,0.0,0.0,0.0,0.0};
+
+            float g_factor = 1.0/(va[0]+vb[0]);
+            float g_c_factor;
+            if(optim_color)
+                g_c_factor = 1.0/(va[1]+vb[1]);
+            else
+                g_c_factor = 0.0;
+
+            for(int k=0; k < nsteps; ++k){
+                float g[7]       = {0.0,0.0,0.0,0.0,0.0,0.0,0.0};
+                float g_c[7]     = {0.0,0.0,0.0,0.0,0.0,0.0,0.0};
+                float g_combo[7] = {0.0,0.0,0.0,0.0,0.0,0.0,0.0};
+
+                get_gradient(molA, molA_type, molA_num_atoms_i, NmolA,
+                            molB, molB_type, molB_num_atom,    NmolB,
+                            rmat, pmat, N_features,
+                            g, g_c, q, t, vs);
+
+                #pragma unroll
+                for(int i=0;i<7;++i){
+                    g[i] = g[i]*g_factor;
+                }
+
+                if (optim_color){
+                    #pragma unroll
+                    for(int i=0;i<7;++i){
+                        g_c[i] = g_c[i]*g_c_factor;
+                    }
+                    #pragma unroll
+                    for(int i=0;i<7;++i){
+                        g_combo[i] = (1-mixing_param)*g[i]+ mixing_param*g_c[i];
+                    }
+                    adagrad_step(q,t,g_combo, cache, lr_q, lr_t);
+                }
+                else{
+                    adagrad_step(q,t,g, cache, lr_q, lr_t);
+                }
+
+                float magq = sqrt(q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3]);
+                q[0] = q[0]/magq;
+                q[1] = q[1]/magq;
+                q[2] = q[2]/magq;
+                q[3] = q[3]/magq;
+            }
+
+            float temp[7] = {0.0,0.0,0.0,0.0,0.0,0.0,0.0};
+            get_gradient(molA, molA_type, molA_num_atoms_i, NmolA,
+                            molB, molB_type, molB_num_atom, NmolB,
+                            rmat, pmat, N_features,
+                            temp,temp, q, t, vs);
+
+            float ts = vs[0] / (va[0]+vb[0] - vs[0]);
+            float tc = 0.0;
+            if(optim_color){
+                tc = vs[1] / (va[1] + vb[1] - vs[1]);
+            }
+            float total = (ts *(1-mixing_param) + tc*mixing_param);
+
+            if (total > scores_register[0]){
+                scores_register[0] = total;
+                scores_register[1] = ts;
+                scores_register[2] = tc;
+                scores_register[3] = vs[0];
+                scores_register[4] = vs[1];
+                scores_register[5] = va[0];
+                scores_register[6] = vb[0];
+                scores_register[7] = va[1];
+                scores_register[8] = vb[1];
+                scores_register[9]  = q[0];
+                scores_register[10] = q[1];
+                scores_register[11] = q[2];
+                scores_register[12] = q[3];
+                scores_register[13] = t[0];
+                scores_register[14] = t[1];
+                scores_register[15] = t[2];
+                scores_register[16] = qr[0];
+                scores_register[17] = qr[1];
+                scores_register[18] = qr[2];
+                scores_register[19] = qr[3];
+            }
+
+        // Write to output: scores layout is (n_queries, Nv, DV)
+        long out_base = (long)query_idx * Nv * DV + idx * DV;
+        scores[out_base]    = scores_register[0];
+        scores[out_base+1]  = scores_register[1];
+        scores[out_base+2]  = scores_register[2];
+        scores[out_base+3]  = scores_register[3];
+        scores[out_base+4]  = scores_register[4];
+        scores[out_base+5]  = scores_register[5];
+        scores[out_base+6]  = scores_register[6];
+        scores[out_base+7]  = scores_register[7];
+        scores[out_base+8]  = scores_register[8];
+        scores[out_base+9]  = scores_register[9];
+        scores[out_base+10] = scores_register[10];
+        scores[out_base+11] = scores_register[11];
+        scores[out_base+12] = scores_register[12];
+        scores[out_base+13] = scores_register[13];
+        scores[out_base+14] = scores_register[14];
+        scores[out_base+15] = scores_register[15];
+        scores[out_base+16] = scores_register[16];
+        scores[out_base+17] = scores_register[17];
+        scores[out_base+18] = scores_register[18];
+        scores[out_base+19] = scores_register[19];
+        }
+
+    __syncthreads();
+    }
+}
+
+
+// Batched entry point: all queries in a single kernel launch + single sync
+void optimize_overlap_gpu_batched(
+    const float * molAs, const int * molAs_types, const int * molA_num_atoms, int NmolA, int n_queries,
+    const float * molBs, const int * molB_types,  const int * molB_num_atoms, int NmolB, long num_molBs,
+    const float * rmat, const float * pmat, int N_features, float * scores,
+    bool optim_color, float lr_q, float lr_t, int nsteps, float mixing_param, int start_mode, int device_id){
+
+    long Nv = num_molBs;
+    int blocks_per_batch = (Nv + NTHREADS - 1) / NTHREADS;
+    int total_blocks = n_queries * blocks_per_batch;
+
+    dim3 blockDim(NTHREADS);
+    dim3 gridDim(total_blocks);
+
+    const int D_local = 4;
+    size_t sharedMemSize = NmolA*D_local*sizeof(float)+8*sizeof(float)+NmolA*sizeof(int)+2*(N_features*N_features)*sizeof(float);
+
+    cudaSetDevice(device_id);
+    optimize_batched<<<gridDim,blockDim,sharedMemSize>>>(
+        molAs, molAs_types, molA_num_atoms, NmolA,
+        molBs, molB_types, molB_num_atoms, NmolB,
+        rmat, pmat, N_features,
+        scores, Nv, blocks_per_batch, n_queries,
+        optim_color, lr_q, lr_t, nsteps, mixing_param, start_mode);
+    cudaSetDevice(device_id); cudaGetLastError();
+    cudaSetDevice(device_id); cudaDeviceSynchronize();
+    cudaSetDevice(device_id); cudaGetLastError();
+}
 
 
 // This is the entry point function. The optimization kernel is lauched from here
