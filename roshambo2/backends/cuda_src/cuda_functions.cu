@@ -1003,11 +1003,14 @@ __global__ void optimize_batched(
 
 
 // Batched entry point: all queries in a single kernel launch + single sync
+// When stream != 0 (i.e. a PyTorch stream is provided), we skip
+// cudaDeviceSynchronize and rely on stream ordering for correctness.
 void optimize_overlap_gpu_batched(
     const float * molAs, const int * molAs_types, const int * molA_num_atoms, int NmolA, int n_queries,
     const float * molBs, const int * molB_types,  const int * molB_num_atoms, int NmolB, long num_molBs,
     const float * rmat, const float * pmat, int N_features, float * scores,
-    bool optim_color, float lr_q, float lr_t, int nsteps, float mixing_param, int start_mode, int device_id){
+    bool optim_color, float lr_q, float lr_t, int nsteps, float mixing_param, int start_mode, int device_id,
+    cudaStream_t stream){
 
     long Nv = num_molBs;
     int blocks_per_batch = (Nv + NTHREADS - 1) / NTHREADS;
@@ -1020,15 +1023,21 @@ void optimize_overlap_gpu_batched(
     size_t sharedMemSize = NmolA*D_local*sizeof(float)+8*sizeof(float)+NmolA*sizeof(int)+2*(N_features*N_features)*sizeof(float);
 
     cudaSetDevice(device_id);
-    optimize_batched<<<gridDim,blockDim,sharedMemSize>>>(
+    optimize_batched<<<gridDim,blockDim,sharedMemSize,stream>>>(
         molAs, molAs_types, molA_num_atoms, NmolA,
         molBs, molB_types, molB_num_atoms, NmolB,
         rmat, pmat, N_features,
         scores, Nv, blocks_per_batch, n_queries,
         optim_color, lr_q, lr_t, nsteps, mixing_param, start_mode);
-    cudaSetDevice(device_id); cudaGetLastError();
-    cudaSetDevice(device_id); cudaDeviceSynchronize();
-    cudaSetDevice(device_id); cudaGetLastError();
+    CUDA_CHECK_ERROR(cudaGetLastError());
+
+    // Only synchronize for the default stream (numpy/legacy code path).
+    // For PyTorch streams, correctness is guaranteed by stream ordering:
+    // subsequent ops on the same stream will wait for this kernel.
+    if (stream == 0) {
+        cudaDeviceSynchronize();
+        CUDA_CHECK_ERROR(cudaGetLastError());
+    }
 }
 
 

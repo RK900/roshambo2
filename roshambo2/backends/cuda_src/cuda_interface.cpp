@@ -34,6 +34,7 @@
 #include "cuda_functions.cuh"
 #include <omp.h>
 #include <vector>
+#include <c10/cuda/CUDAStream.h>
 
 namespace py = pybind11;
 
@@ -291,10 +292,6 @@ public:
         RMAT = RMAT.contiguous().to(torch::kFloat32);
         PMAT = PMAT.contiguous().to(torch::kFloat32);
 
-        // AN/BN are small (one int per molecule) - move to CPU for host-side access
-        auto AN_cpu = AN.to(torch::kCPU).contiguous().to(torch::kInt32);
-        auto BN_cpu = BN.to(torch::kCPU).contiguous().to(torch::kInt32);
-
         long current_n_mols = B.size(0);
         long current_mol_atoms = B.size(1);
         long query_mol_atoms = A.size(1);
@@ -314,7 +311,7 @@ public:
                                  B.is_cuda() && B.device().index() == device_id;
 
             if (all_on_device) {
-                // Ensure interaction matrices and BN are on device
+                // Ensure interaction matrices and AN/BN are on device
                 auto rmat_d = RMAT.to(target_device).contiguous();
                 auto pmat_d = PMAT.to(target_device).contiguous();
                 auto BN_d = BN.to(target_device).contiguous().to(torch::kInt32);
@@ -326,7 +323,13 @@ public:
 
                 int64_t n_queries = A.size(0);
 
-                // Single batched kernel launch for all queries — one launch, one sync
+                // Get PyTorch's current CUDA stream for proper pipeline integration.
+                // This avoids the implicit serialization caused by the legacy default
+                // stream (stream 0) and removes the need for cudaDeviceSynchronize.
+                cudaStream_t stream = c10::cuda::getCurrentCUDAStream(device_id).stream();
+
+                // Single batched kernel launch — no sync needed, stream ordering
+                // guarantees subsequent PyTorch ops see the completed results.
                 optimize_overlap_gpu_batched(
                     A.data_ptr<float>(),
                     AT.data_ptr<int>(),
@@ -343,13 +346,18 @@ public:
                     n_features,
                     V.data_ptr<float>(),
                     optim_color, lr_q, lr_t, nsteps, mixing_param,
-                    start_mode_method, device_id
+                    start_mode_method, device_id,
+                    stream
                 );
                 return;
             }
         }
 
         // Fallback: multi-GPU or cross-device — copy to pre-allocated buffers
+        // Need AN/BN on CPU for host-side indexing in the per-query loop
+        auto AN_cpu = AN.to(torch::kCPU).contiguous().to(torch::kInt32);
+        auto BN_cpu = BN.to(torch::kCPU).contiguous().to(torch::kInt32);
+
         int base_len = current_n_mols / n_gpus;
         int remainder = current_n_mols % n_gpus;
 

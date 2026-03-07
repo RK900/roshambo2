@@ -59,5 +59,6 @@ void optimize_overlap_gpu_batched(
     const float * molAs, const int * molAs_types, const int * molA_num_atoms, int NmolA, int n_queries,
     const float * molBs, const int * molB_types,  const int * molB_num_atoms, int NmolB, long num_molBs,
     const float * rmat, const float * pmat, int N_features, float * scores,
-    bool optim_color, float lr_q, float lr_t, int nsteps, float mixing_param, int start_mode, int device_id);
+    bool optim_color, float lr_q, float lr_t, int nsteps, float mixing_param, int start_mode, int device_id,
+    cudaStream_t stream = 0);
 

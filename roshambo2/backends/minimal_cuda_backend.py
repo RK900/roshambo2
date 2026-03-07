@@ -211,12 +211,17 @@ class PersistentCudaShapeOverlay:
 
         # Initialize Persistent Context on the correct GPU
         self.ctx = CudaOverlapContext(n_gpus, max_mols, max_atoms, n_features, self.scores_dim, device_id)
-        
+
         # Default optimizer settings
         self.lr_q = 0.1
         self.lr_t = 0.1
         self.steps = 50
         self.verbosity = 0
+
+        # Cached GPU tensors for the torch path (avoid re-creating every call)
+        self._cached_im_r = None
+        self._cached_im_p = None
+        self._cached_device = None
 
     def calculate_overlap_batch(self, query_data, data_data, start_mode=1, mixing=0.5, color_generator=None):
         """
@@ -257,6 +262,18 @@ class PersistentCudaShapeOverlay:
         )
         return scores
 
+    def _get_cached_matrices(self, color_generator, device):
+        """Return interaction matrices cached on the correct GPU device."""
+        if self._cached_im_r is None or self._cached_device != device:
+            self._cached_im_r = torch.from_numpy(
+                np.ascontiguousarray(color_generator.interaction_matrix_r, dtype=np.float32)
+            ).to(device)
+            self._cached_im_p = torch.from_numpy(
+                np.ascontiguousarray(color_generator.interaction_matrix_p, dtype=np.float32)
+            ).to(device)
+            self._cached_device = device
+        return self._cached_im_r, self._cached_im_p
+
     def calculate_overlap_batch_torch(self, query_f_x, query_f_types, query_f_n_real,
                                        data_f_x, data_f_types, data_f_n_real,
                                        color_generator, start_mode=1, mixing=0.5):
@@ -282,21 +299,16 @@ class PersistentCudaShapeOverlay:
         n_d = data_f_x.shape[0]
         device = data_f_x.device
 
-        # Interaction matrices as float32 tensors on the same device
-        im_r = torch.from_numpy(
-            np.ascontiguousarray(color_generator.interaction_matrix_r, dtype=np.float32)
-        ).to(device)
-        im_p = torch.from_numpy(
-            np.ascontiguousarray(color_generator.interaction_matrix_p, dtype=np.float32)
-        ).to(device)
+        # Cached interaction matrices (avoid numpy->torch->GPU copy every call)
+        im_r, im_p = self._get_cached_matrices(color_generator, device)
 
         # Allocate output scores on GPU
-        scores = torch.zeros((n_q, n_d, self.scores_dim), dtype=torch.float32, device=device)
+        scores = torch.empty((n_q, n_d, self.scores_dim), dtype=torch.float32, device=device)
 
         # Call the zero-copy C++ method
         self.ctx.optimize_torch(
-            query_f_x.contiguous(), query_f_types.contiguous().int(), query_f_n_real.contiguous().int(),
-            data_f_x.contiguous(), data_f_types.contiguous().int(), data_f_n_real.contiguous().int(),
+            query_f_x, query_f_types.int(), query_f_n_real.int(),
+            data_f_x, data_f_types.int(), data_f_n_real.int(),
             im_r, im_p, scores,
             True, mixing, self.lr_q, self.lr_t, self.steps,
             start_mode, self.verbosity
