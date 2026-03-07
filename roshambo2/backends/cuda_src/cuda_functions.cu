@@ -274,22 +274,23 @@ __device__ void volume_single(const float * molA, const int * molA_type, int mol
     }
 
     for(int j=molB_num_atoms; j<NmolB; j++){
+        float wb = molB[j*D+3];
+        if (wb == 0.0f) break;  // padding starts here, all remaining atoms are padding
         for(int i=molA_num_atoms; i<NmolA; i++){
+            float wa = molA[i*D+3];
+            if (wa == 0.0f) break;  // padding starts here
 
             float dx = molA[i*D]   - molB[j*D];
             float dy = molA[i*D+1] - molB[j*D+1];
             float dz = molA[i*D+2] - molB[j*D+2];
 
-            float d2 = dx*dx + dy*dy + dz*dz;        
+            float d2 = dx*dx + dy*dy + dz*dz;
 
             int ta = molA_type[i];
             int tb = molB_type[j];
 
             float a = rmat[ta*N_features+tb];
             float p = pmat[ta*N_features+tb];
-        
-            float wa = molA[i*D+3];
-            float wb = molB[j*D+3];
 
             float kij = exp(-a*a*d2/(a+a))*wa*wb;
 
@@ -413,39 +414,33 @@ __device__ void get_gradient(const float * molA, const int * molA_type, int molA
     #ifdef DEBUG
     printf("loop limits2: %d:%d %d:%d\n",molA_num_atoms, NmolA, molB_num_atoms, NmolB);
     #endif
-    // TODO: combine both loops to half the global memory access
     for( int j=molB_num_atoms; j<NmolB; j++){
+
+        float wb = molB[j*D+3];
+        if (wb == 0.0f) break;  // padding starts here
 
         // store values in registers
         float molBTr[3];
 
         // molB needs to be transformed by q
-        matvec3x3x3(M, &molB[j*D], molBTr); 
+        matvec3x3x3(M, &molB[j*D], molBTr);
 
-        float wb = molB[j*D+3];
-
-        // TODO: can terminate j loop early
         int tb = molB_type[j];
-
 
         // loop over molA in inner loop. Note it is in shared memory
         for(int i=molA_num_atoms; i<NmolA; i++){
+            float wa = molA[i*D+3];
+            if (wa == 0.0f) break;  // padding starts here
 
             int ta = molA_type[i];
 
             float a = rmat[ta*N_features+tb];
             float p = pmat[ta*N_features+tb];
 
-            // if (a==0.0f) continue; //TODO
-
-
             // molA needs to be translated by -t
             float molATx = molA[i*D]   - t[0];
             float molATy = molA[i*D+1] - t[1];
             float molATz = molA[i*D+2] - t[2];
-
-            float wa = molA[i*D+3];
-
 
             float dx = molATx - molBTr[0];
             float dy = molATy - molBTr[1];

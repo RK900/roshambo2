@@ -63,6 +63,7 @@ class SimpleRoshamboData:
             self.allowed_features = {18, 19, 20, 21, 22, 36, 41, 42}
         else:
             self.allowed_features = set(allowed_features)
+        self._allowed_sorted = np.array(sorted(self.allowed_features))
         
         for mol_dict in self.mol_list:
             nodes = mol_dict['graph_nodes']
@@ -100,7 +101,8 @@ class SimpleRoshamboData:
 
             if len(active_rows) > 0:
                 feat_coords = pos[active_rows]
-                feat_types = active_cols + 1 # 1-based indexing for features
+                compact_idx = np.searchsorted(self._allowed_sorted, active_cols)
+                feat_types = compact_idx + 1  # compact 1-based types
                 coords_list.append(feat_coords)
                 types_list.append(feat_types.astype(int))
 

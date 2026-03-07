@@ -129,9 +129,10 @@ class PheneShapeOverlay:
         self.allowed_features = allowed_features
         self._allowed_tensor = None  # Lazily initialized on correct device
 
-        # Initialize Color Generator
-        # Phene generator produces 48 dim features + padding -> 49
-        self.color_gen = BitVectorColorGenerator(n_bits=48)
+        # Compact color generator: only K+1 types (9) instead of 49,
+        # reducing CUDA shared memory by ~30x for better kernel occupancy
+        n_compact = len(allowed_features)
+        self.color_gen = BitVectorColorGenerator(n_bits=n_compact)
 
         # Initialize Persistent Context on the correct device
         self.overlay = PersistentCudaShapeOverlay(
@@ -152,18 +153,17 @@ class PheneShapeOverlay:
 
     def _prepare_batch_torch(self, mol_graph):
         """
-        GPU-native feature expansion. Replaces _unbatch + SimpleRoshamboData.
-        Converts a PyG Batch into padded (B, max_atoms, 4) tensors entirely on GPU.
+        GPU-native feature expansion. Converts a PyG Batch into padded
+        (B, max_atoms, 4) tensors entirely on GPU.
 
-        Includes COM centering and PCA alignment to match the original Roshambo2
-        molecule preparation pipeline (Roshambo2Mol.__init__).
+        Optimized path: single to_dense_batch call, no argsort, compact types.
 
         Args:
             mol_graph: PyG Batch with .x (N_total, 48), .pos (N_total, 3), .batch (N_total,)
 
         Returns:
             f_x: (B, max_atoms_dense, 4) float32 CUDA tensor [x, y, z, weight]
-            f_types: (B, max_atoms_dense) int32 CUDA tensor
+            f_types: (B, max_atoms_dense) int32 CUDA tensor (compact types 0..K)
             f_n_real: (B,) int32 CUDA tensor (number of real atoms per molecule)
             num_graphs: int
         """
@@ -172,68 +172,66 @@ class PheneShapeOverlay:
         batch_idx = mol_graph.batch  # (N_total,)
         device = x.device
 
-        # --- Remove H atoms (bit 0 of feature vector = H atom type) ---
-        # Original Roshambo2 always removes Hs for shape calculations (classes.py:45,62)
-        heavy_mask = x[:, 0] < 0.5  # bit 0 = H atom type; keep non-H atoms
+        # Remove H atoms (bit 0 = H atom type)
+        heavy_mask = x[:, 0] < 0.5
         x = x[heavy_mask]
         pos = pos[heavy_mask]
         batch_idx = batch_idx[heavy_mask]
 
         num_graphs = int(batch_idx.max().item()) + 1
         allowed = self._get_allowed_tensor(device)
+        K = allowed.shape[0]
 
         # Count real (heavy) atoms per molecule
-        n_real = torch.zeros(num_graphs, device=device, dtype=torch.int32)
-        n_real.scatter_add_(0, batch_idx.long(), torch.ones(batch_idx.shape[0], device=device, dtype=torch.int32))
-
-        # --- COM centering (required for CUDA optimizer convergence) ---
-        # The optimizer starts with zero translation, so molecules must be centered
-        # at origin for the initial overlap to be meaningful.
         batch_idx_long = batch_idx.long()
-        counts = torch.zeros(num_graphs, 1, device=device, dtype=pos.dtype)
-        counts.scatter_add_(0, batch_idx_long.unsqueeze(1), torch.ones(pos.shape[0], 1, device=device, dtype=pos.dtype))
+        n_real = torch.zeros(num_graphs, device=device, dtype=torch.int32)
+        n_real.scatter_add_(0, batch_idx_long, torch.ones(batch_idx.shape[0], device=device, dtype=torch.int32))
+
+        # COM centering (required for CUDA optimizer convergence)
         sum_pos = torch.zeros(num_graphs, 3, device=device, dtype=pos.dtype)
         sum_pos.scatter_add_(0, batch_idx_long.unsqueeze(1).expand(-1, 3), pos)
-        centroids = sum_pos / counts
+        centroids = sum_pos / n_real.float().unsqueeze(1)
         pos = pos - centroids[batch_idx_long]
 
-        # Feature expansion: find active (> 0.5) features in allowed columns
-        feat_vals = x[:, allowed]  # (N_total, n_allowed)
-        active_rows, active_cols_local = torch.where(feat_vals > 0.5)
+        # Single to_dense_batch: combine pos + allowed feature columns
+        combined = torch.cat([pos, x[:, allowed]], dim=-1)  # (N, 3+K)
+        combined_dense, mask = to_dense_batch(combined, batch_idx)  # (B, M, 3+K)
+        pos_dense = combined_dense[:, :, :3]   # (B, M, 3)
+        feat_dense = combined_dense[:, :, 3:]  # (B, M, K)
+        M = pos_dense.shape[1]
 
-        # Feature types: allowed[col] + 1 (1-based, type 0 = real atom)
-        feat_types = (allowed[active_cols_local] + 1).int()
-        feat_pos = pos[active_rows]
-        feat_batch = batch_idx[active_rows]
+        # Feature expansion in dense space (no argsort needed)
+        feat_active = (feat_dense > 0.5) & mask.unsqueeze(-1)  # (B, M, K)
 
-        # Concatenate real atoms + feature atoms
-        all_pos = torch.cat([pos, feat_pos], dim=0)
-        all_types = torch.cat([
-            torch.zeros(pos.shape[0], device=device, dtype=torch.int32),
-            feat_types
-        ], dim=0)
-        all_batch = torch.cat([batch_idx, feat_batch], dim=0)
+        # Count feature atoms per molecule to determine output size
+        feat_flat = feat_active.reshape(num_graphs, M * K)  # (B, M*K)
+        n_feat_per_mol = feat_flat.sum(dim=1)
+        max_feat = int(n_feat_per_mol.max().item())
+        M_total = M + max_feat
 
-        # Sort by batch index (required by to_dense_batch)
-        sort_idx = torch.argsort(all_batch, stable=True)
-        all_pos = all_pos[sort_idx]
-        all_types = all_types[sort_idx]
-        all_batch = all_batch[sort_idx]
+        # Allocate output
+        f_x = torch.zeros(num_graphs, M_total, 4, device=device)
+        f_types = torch.zeros(num_graphs, M_total, device=device, dtype=torch.int32)
 
-        # Pad to dense: (B, max_atoms_dense, 3) and mask
-        pos_dense, mask = to_dense_batch(all_pos, all_batch)
+        # Real atoms (positions 0..M-1, with mask for padding)
+        f_x[:, :M, :3] = pos_dense
+        f_x[:, :M, 3] = mask.float()
 
-        # Types: use float wrapper for to_dense_batch, then cast back
-        types_dense, _ = to_dense_batch(
-            all_types.float().unsqueeze(-1), all_batch
-        )
-        types_dense = types_dense.squeeze(-1).int()
+        # Feature atoms: scatter after each molecule's real atoms using cumsum offsets
+        if max_feat > 0:
+            feat_cum = torch.cumsum(feat_flat.int(), dim=1)  # (B, M*K)
+            b_idx, j_idx = torch.where(feat_flat)
+            atom_idx = j_idx // K
+            feat_k = j_idx % K
 
-        # Build f_x: (B, max_atoms_dense, 4) with weight=1.0 for valid atoms
-        weight = mask.float().unsqueeze(-1)
-        f_x = torch.cat([pos_dense, weight], dim=-1)
+            # Place feature atoms right after real atoms for each molecule
+            target_col = n_real[b_idx].long() + feat_cum[b_idx, j_idx].long() - 1
 
-        return f_x.contiguous(), types_dense.contiguous(), n_real, num_graphs
+            f_x[b_idx, target_col, :3] = pos_dense[b_idx, atom_idx]
+            f_x[b_idx, target_col, 3] = 1.0
+            f_types[b_idx, target_col] = (feat_k + 1).int()  # compact types 1..K
+
+        return f_x.contiguous(), f_types.contiguous(), n_real, num_graphs
 
     def _unbatch(self, batch_data) -> List[Dict[str, np.ndarray]]:
         """
