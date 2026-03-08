@@ -206,8 +206,7 @@ class PheneShapeOverlay:
         # Count feature atoms per molecule to determine output size
         feat_flat = feat_active.reshape(num_graphs, M * K)  # (B, M*K)
         n_feat_per_mol = feat_flat.sum(dim=1)
-        max_feat = int(n_feat_per_mol.max().item())
-        M_total = M + max_feat
+        M_total = int((n_real + n_feat_per_mol).max().item())
 
         # Allocate output
         f_x = torch.zeros(num_graphs, M_total, 4, device=device)
@@ -218,7 +217,7 @@ class PheneShapeOverlay:
         f_x[:, :M, 3] = mask.float()
 
         # Feature atoms: scatter after each molecule's real atoms using cumsum offsets
-        if max_feat > 0:
+        if n_feat_per_mol.sum() > 0:
             feat_cum = torch.cumsum(feat_flat.int(), dim=1)  # (B, M*K)
             b_idx, j_idx = torch.where(feat_flat)
             atom_idx = j_idx // K
