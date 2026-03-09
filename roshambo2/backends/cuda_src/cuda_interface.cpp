@@ -324,31 +324,70 @@ public:
                 int64_t n_queries = A.size(0);
 
                 // Get PyTorch's current CUDA stream for proper pipeline integration.
-                // This avoids the implicit serialization caused by the legacy default
-                // stream (stream 0) and removes the need for cudaDeviceSynchronize.
                 cudaStream_t stream = c10::cuda::getCurrentCUDAStream(device_id).stream();
 
-                // Single batched kernel launch — no sync needed, stream ordering
-                // guarantees subsequent PyTorch ops see the completed results.
-                optimize_overlap_gpu_batched(
-                    A.data_ptr<float>(),
-                    AT.data_ptr<int>(),
-                    AN_d.data_ptr<int>(),
-                    (int)query_mol_atoms,
-                    (int)n_queries,
-                    B.data_ptr<float>(),
-                    BT.data_ptr<int>(),
-                    BN_d.data_ptr<int>(),
-                    (int)current_mol_atoms,
-                    current_n_mols,
-                    rmat_d.data_ptr<float>(),
-                    pmat_d.data_ptr<float>(),
-                    n_features,
-                    V.data_ptr<float>(),
-                    optim_color, lr_q, lr_t, nsteps, mixing_param,
-                    start_mode_method, device_id,
-                    stream
-                );
+                // Host-side start mode table (mirrors __device__ start_mode_n)
+                static const int start_mode_n_host[3] = {1, 4, 10};
+                int N_starts = start_mode_n_host[start_mode_method];
+
+                if (N_starts <= 1) {
+                    // Single start: output directly to V (no overhead)
+                    optimize_overlap_gpu_batched(
+                        A.data_ptr<float>(),
+                        AT.data_ptr<int>(),
+                        AN_d.data_ptr<int>(),
+                        (int)query_mol_atoms,
+                        (int)n_queries,
+                        B.data_ptr<float>(),
+                        BT.data_ptr<int>(),
+                        BN_d.data_ptr<int>(),
+                        (int)current_mol_atoms,
+                        current_n_mols,
+                        rmat_d.data_ptr<float>(),
+                        pmat_d.data_ptr<float>(),
+                        n_features,
+                        V.data_ptr<float>(),
+                        optim_color, lr_q, lr_t, nsteps, mixing_param,
+                        start_mode_method, device_id,
+                        stream
+                    );
+                } else {
+                    // Parallel starts: kernel writes (N_starts, n_queries, n_mols, DV),
+                    // then we reduce to the best start per (query, candidate) pair.
+                    auto V_expanded = torch::empty(
+                        {(int64_t)N_starts, n_queries, (int64_t)current_n_mols, (int64_t)scores_dim},
+                        V.options()
+                    );
+
+                    optimize_overlap_gpu_batched(
+                        A.data_ptr<float>(),
+                        AT.data_ptr<int>(),
+                        AN_d.data_ptr<int>(),
+                        (int)query_mol_atoms,
+                        (int)n_queries,
+                        B.data_ptr<float>(),
+                        BT.data_ptr<int>(),
+                        BN_d.data_ptr<int>(),
+                        (int)current_mol_atoms,
+                        current_n_mols,
+                        rmat_d.data_ptr<float>(),
+                        pmat_d.data_ptr<float>(),
+                        n_features,
+                        V_expanded.data_ptr<float>(),
+                        optim_color, lr_q, lr_t, nsteps, mixing_param,
+                        start_mode_method, device_id,
+                        stream
+                    );
+
+                    // Reduce: find best start per (query, candidate) using combo score (index 0)
+                    auto combo_scores = V_expanded.select(-1, 0);  // (N_starts, n_queries, n_mols)
+                    auto best_idx = std::get<1>(combo_scores.max(0));  // (n_queries, n_mols)
+
+                    // Gather best scores into output V
+                    auto gather_idx = best_idx.unsqueeze(0).unsqueeze(-1)
+                                      .expand({1, n_queries, (int64_t)current_n_mols, (int64_t)scores_dim});
+                    V.copy_(V_expanded.gather(0, gather_idx).squeeze(0));
+                }
                 return;
             }
         }

@@ -57,9 +57,17 @@ class PheneOverlayBatchResult:
     @property
     def rotation(self) -> np.ndarray:
         """Rotation Matrices (num_anchors, batch_size, 3, 3)"""
-        quats = self.raw_scores[:, :, 9:13]
-        w, x, y, z = quats[..., 0], quats[..., 1], quats[..., 2], quats[..., 3]
-        R = np.empty(quats.shape[:-1] + (3, 3), dtype=np.float32)
+        raw = self.raw_scores
+        q_opt = raw[:, :, 9:13]
+        q_start = raw[:, :, 16:20]
+        # Hamilton product: q_total = q_opt * q_start
+        w1, x1, y1, z1 = q_opt[..., 0], q_opt[..., 1], q_opt[..., 2], q_opt[..., 3]
+        w2, x2, y2, z2 = q_start[..., 0], q_start[..., 1], q_start[..., 2], q_start[..., 3]
+        w = w1*w2 - x1*x2 - y1*y2 - z1*z2
+        x = w1*x2 + x1*w2 + y1*z2 - z1*y2
+        y = w1*y2 - x1*z2 + y1*w2 + z1*x2
+        z = w1*z2 + x1*y2 - y1*x2 + z1*w2
+        R = np.empty(q_opt.shape[:-1] + (3, 3), dtype=np.float32)
         R[..., 0, 0] = 1 - 2*y*y - 2*z*z
         R[..., 1, 1] = 1 - 2*x*x - 2*z*z
         R[..., 2, 2] = 1 - 2*x*x - 2*y*y
@@ -75,9 +83,16 @@ class PheneOverlayBatchResult:
     def rotation_torch(self) -> torch.Tensor:
         """Rotation Matrices as torch tensor (num_anchors, batch_size, 3, 3)"""
         raw = self.raw_scores_torch
-        quats = raw[:, :, 9:13]
-        w, x, y, z = quats[..., 0], quats[..., 1], quats[..., 2], quats[..., 3]
-        R = torch.empty(quats.shape[:-1] + (3, 3), dtype=torch.float32, device=quats.device)
+        q_opt = raw[:, :, 9:13]
+        q_start = raw[:, :, 16:20]
+        # Hamilton product: q_total = q_opt * q_start
+        w1, x1, y1, z1 = q_opt[..., 0], q_opt[..., 1], q_opt[..., 2], q_opt[..., 3]
+        w2, x2, y2, z2 = q_start[..., 0], q_start[..., 1], q_start[..., 2], q_start[..., 3]
+        w = w1*w2 - x1*x2 - y1*y2 - z1*z2
+        x = w1*x2 + x1*w2 + y1*z2 - z1*y2
+        y = w1*y2 - x1*z2 + y1*w2 + z1*x2
+        z = w1*z2 + x1*y2 - y1*x2 + z1*w2
+        R = torch.empty(q_opt.shape[:-1] + (3, 3), dtype=torch.float32, device=raw.device)
         R[..., 0, 0] = 1 - 2*y*y - 2*z*z
         R[..., 1, 1] = 1 - 2*x*x - 2*z*z
         R[..., 2, 2] = 1 - 2*x*x - 2*y*y
