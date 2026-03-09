@@ -360,7 +360,7 @@ class PheneShapeOverlay:
         all_scores = self.overlay.calculate_overlap_batch_torch(
             query_f_x, query_f_types, query_f_n_real,
             f_x, f_types, f_n_real,
-            self.color_gen, mixing=mixing, start_mode=0,
+            self.color_gen, mixing=mixing, start_mode=1,
         )
 
         # 4. Handle invalid anchors by padding
