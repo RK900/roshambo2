@@ -169,7 +169,7 @@ class MinimalCudaShapeOverlay:
         
         self.lr_q = 0.1
         self.lr_t = 0.1
-        self.steps = 50
+        self.steps = 30
 
         n_q = len(self.query_data.f_names)
         n_d = len(self.data.f_names)
@@ -217,7 +217,7 @@ class PersistentCudaShapeOverlay:
         # Default optimizer settings
         self.lr_q = 0.1
         self.lr_t = 0.1
-        self.steps = 50
+        self.steps = 30
         self.verbosity = 0
 
         # Cached GPU tensors for the torch path (avoid re-creating every call)

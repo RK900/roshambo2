@@ -330,6 +330,22 @@ public:
                 static const int start_mode_n_host[3] = {1, 4, 10};
                 int N_starts = start_mode_n_host[start_mode_method];
 
+                // Precompute self-overlaps for queries and candidates
+                auto self_overlaps_A = torch::empty({n_queries, 2}, V.options());
+                auto self_overlaps_B = torch::empty({(int64_t)current_n_mols, 2}, V.options());
+
+                compute_self_overlaps_gpu(
+                    A.data_ptr<float>(), AT.data_ptr<int>(), AN_d.data_ptr<int>(),
+                    (int)query_mol_atoms, (int)n_queries,
+                    rmat_d.data_ptr<float>(), pmat_d.data_ptr<float>(), n_features,
+                    self_overlaps_A.data_ptr<float>(), device_id, stream);
+
+                compute_self_overlaps_gpu(
+                    B.data_ptr<float>(), BT.data_ptr<int>(), BN_d.data_ptr<int>(),
+                    (int)current_mol_atoms, (int)current_n_mols,
+                    rmat_d.data_ptr<float>(), pmat_d.data_ptr<float>(), n_features,
+                    self_overlaps_B.data_ptr<float>(), device_id, stream);
+
                 if (N_starts <= 1) {
                     // Single start: output directly to V (no overhead)
                     optimize_overlap_gpu_batched(
@@ -349,7 +365,9 @@ public:
                         V.data_ptr<float>(),
                         optim_color, lr_q, lr_t, nsteps, mixing_param,
                         start_mode_method, device_id,
-                        stream
+                        stream,
+                        self_overlaps_A.data_ptr<float>(),
+                        self_overlaps_B.data_ptr<float>()
                     );
                 } else {
                     // Parallel starts: kernel writes (N_starts, n_queries, n_mols, DV),
@@ -376,7 +394,9 @@ public:
                         V_expanded.data_ptr<float>(),
                         optim_color, lr_q, lr_t, nsteps, mixing_param,
                         start_mode_method, device_id,
-                        stream
+                        stream,
+                        self_overlaps_A.data_ptr<float>(),
+                        self_overlaps_B.data_ptr<float>()
                     );
 
                     // Reduce: find best start per (query, candidate) using combo score (index 0)

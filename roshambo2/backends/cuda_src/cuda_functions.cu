@@ -796,6 +796,46 @@ __global__ void optimize(const float * molA_global, const int * molA_type_global
 
 
 
+// Self-overlap precomputation kernel.
+// Computes volume_single(mol, mol) for each molecule in the batch.
+// Output: self_overlaps (n_mols, 2) containing [shape_overlap, color_overlap].
+// Self-overlap is rotation-invariant, so this can be precomputed once
+// and reused across all start orientations and query/candidate pairs.
+__global__ void compute_self_overlaps_kernel(
+    const float * mols, const int * mol_types, const int * mol_num_atoms,
+    int NmolMax,
+    const float * rmat_global, const float * pmat_global, int N_features,
+    float * self_overlaps,
+    int n_mols
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_mols) return;
+
+    // Load interaction matrices into shared memory
+    extern __shared__ float shared[];
+    float * rmat = shared;
+    float * pmat = &shared[N_features * N_features];
+
+    size_t tidx = threadIdx.x;
+    for (int l = tidx; l < N_features * N_features; l += blockDim.x) {
+        rmat[l] = rmat_global[l];
+        pmat[l] = pmat_global[l];
+    }
+    __syncthreads();
+
+    const float * mol = &mols[(long)idx * NmolMax * D];
+    const int * mol_type = &mol_types[(long)idx * NmolMax];
+    int num_atoms = mol_num_atoms[idx];
+
+    float v[2];
+    volume_single(mol, mol_type, num_atoms, NmolMax,
+                  mol, mol_type, num_atoms, NmolMax,
+                  rmat, pmat, N_features, v);
+
+    self_overlaps[idx * 2]     = v[0];
+    self_overlaps[idx * 2 + 1] = v[1];
+}
+
 // Batched optimization kernel with parallel start modes.
 // blockIdx.x encodes (query_idx, data_block): query_idx = blockIdx.x / blocks_per_batch,
 // data_block = blockIdx.x % blocks_per_batch.
@@ -810,7 +850,8 @@ __global__ void optimize_batched(
     const float * rmat_global, const float * pmat_global, int N_features,
     float * scores,            // (N_starts, n_queries, Nv, DV)
     int Nv, int blocks_per_batch, int n_queries,
-    bool optim_color, float lr_q, float lr_t, int nsteps, float mixing_param, int start_mode){
+    bool optim_color, float lr_q, float lr_t, int nsteps, float mixing_param, int start_mode,
+    const float * self_overlaps_A, const float * self_overlaps_B){
 
     // Decode block indices: x = (query, data_block), y = start orientation
     int query_idx  = blockIdx.x / blocks_per_batch;
@@ -869,13 +910,21 @@ __global__ void optimize_batched(
         float va[2];
         float vb[2];
 
-        volume_single(molA, molA_type, molA_num_atoms_i, NmolA,
-                    molA, molA_type, molA_num_atoms_i, NmolA,
-                    rmat, pmat, N_features, va);
+        if (self_overlaps_A != nullptr && self_overlaps_B != nullptr) {
+            // Use precomputed self-overlaps (rotation-invariant)
+            va[0] = self_overlaps_A[query_idx * 2];
+            va[1] = self_overlaps_A[query_idx * 2 + 1];
+            vb[0] = self_overlaps_B[idx * 2];
+            vb[1] = self_overlaps_B[idx * 2 + 1];
+        } else {
+            volume_single(molA, molA_type, molA_num_atoms_i, NmolA,
+                        molA, molA_type, molA_num_atoms_i, NmolA,
+                        rmat, pmat, N_features, va);
 
-        volume_single(molB, molB_type, molB_num_atom, NmolB,
-                    molB, molB_type, molB_num_atom, NmolB,
-                    rmat, pmat, N_features, vb);
+            volume_single(molB, molB_type, molB_num_atom, NmolB,
+                        molB, molB_type, molB_num_atom, NmolB,
+                        rmat, pmat, N_features, vb);
+        }
 
         float q[4] = {1.0,0.0,0.0,0.0};
         float t[3] = {0.0,0.0,0.0};
@@ -978,7 +1027,8 @@ void optimize_overlap_gpu_batched(
     const float * molBs, const int * molB_types,  const int * molB_num_atoms, int NmolB, long num_molBs,
     const float * rmat, const float * pmat, int N_features, float * scores,
     bool optim_color, float lr_q, float lr_t, int nsteps, float mixing_param, int start_mode, int device_id,
-    cudaStream_t stream){
+    cudaStream_t stream,
+    const float * self_overlaps_A, const float * self_overlaps_B){
 
     // Host-side start mode table (mirrors __device__ start_mode_n)
     static const int start_mode_n_host[3] = {1, 4, 10};
@@ -1000,7 +1050,8 @@ void optimize_overlap_gpu_batched(
         molBs, molB_types, molB_num_atoms, NmolB,
         rmat, pmat, N_features,
         scores, Nv, blocks_per_batch, n_queries,
-        optim_color, lr_q, lr_t, nsteps, mixing_param, start_mode);
+        optim_color, lr_q, lr_t, nsteps, mixing_param, start_mode,
+        self_overlaps_A, self_overlaps_B);
     CUDA_CHECK_ERROR(cudaGetLastError());
 
     // Only synchronize for the default stream (numpy/legacy code path).
@@ -1012,6 +1063,32 @@ void optimize_overlap_gpu_batched(
     }
 }
 
+
+// Precompute self-overlaps for all molecules in a batch.
+// Launches a simple kernel where each thread computes volume_single(mol, mol).
+void compute_self_overlaps_gpu(
+    const float * mols, const int * mol_types, const int * mol_num_atoms,
+    int NmolMax, int n_mols,
+    const float * rmat, const float * pmat, int N_features,
+    float * self_overlaps,
+    int device_id, cudaStream_t stream){
+
+    dim3 blockDim(NTHREADS);
+    dim3 gridDim((n_mols + NTHREADS - 1) / NTHREADS);
+    size_t sharedMemSize = 2 * N_features * N_features * sizeof(float);
+
+    cudaSetDevice(device_id);
+    compute_self_overlaps_kernel<<<gridDim, blockDim, sharedMemSize, stream>>>(
+        mols, mol_types, mol_num_atoms, NmolMax,
+        rmat, pmat, N_features,
+        self_overlaps, n_mols);
+    CUDA_CHECK_ERROR(cudaGetLastError());
+
+    if (stream == 0) {
+        cudaDeviceSynchronize();
+        CUDA_CHECK_ERROR(cudaGetLastError());
+    }
+}
 
 // This is the entry point function. The optimization kernel is lauched from here
 void optimize_overlap_gpu(const float * molA, const int * molA_type, int molA_num_atoms,  int NmolA, 
