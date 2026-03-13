@@ -235,20 +235,26 @@ __device__ void start_mode_transform(const float * mol, float * transformed_mol,
 
 
 // shape and color overap of molA and molB
-__device__ void volume_single(const float * molA, const int * molA_type, int molA_num_atoms, int NmolA, 
+// color_factor and color_pp_const are precomputed lookup tables in shared memory:
+//   color_factor[ta*N_f+tb]    = rmat[ta*N_f+tb] / 2  (exponential decay factor)
+//   color_pp_const[ta*N_f+tb]  = p^2 * (PI/(2*a))^1.5 (combined coefficient)
+__device__ void volume_single(const float * molA, const int * molA_type, int molA_num_atoms, int NmolA,
                               const float * molB, const int * molB_type, int molB_num_atoms, int NmolB,
-                              const float * rmat, const float * pmat, int N_features, float * v){
+                              const float * rmat, const float * pmat, int N_features,
+                              const float * color_factor, const float * color_pp_const,
+                              float * v){
 
-    const float PI = 3.14159265358;
-    const float KAPPA = 2.41798793102;
-    const float CARBONRADII2 = 1.7*1.7;
+    const float KAPPA = 2.41798793102f;
+    const float CARBONRADII2 = 1.7f*1.7f;
     const float A = KAPPA/CARBONRADII2;
-    const float CONSTANT = pow(PI/(2*A), 1.5);
+    const float SHAPE_FACTOR = A * 0.5f;
+    const float piOver2A = 3.14159265358f/(2.0f*A);
+    const float SHAPE_CONSTANT = 8.0f * piOver2A * sqrtf(piOver2A);
 
 
     float vs = 0.0;
     float vc = 0.0;
-    
+
     // normal atoms first then color
     for(int j=0; j<molB_num_atoms; j++){
         for(int i=0; i<molA_num_atoms; i++){
@@ -257,17 +263,14 @@ __device__ void volume_single(const float * molA, const int * molA_type, int mol
             float dy = molA[i*D+1] - molB[j*D+1];
             float dz = molA[i*D+2] - molB[j*D+2];
 
-            float d2 = dx*dx + dy*dy + dz*dz;        
-
-            auto a1 = A;
-            auto a2 = A;
+            float d2 = dx*dx + dy*dy + dz*dz;
 
             float wa = molA[i*D+3];
             float wb = molB[j*D+3];
 
-            float kij = exp(-a1*a2*d2/(a1+a2))*wa*wb;
+            float kij = __expf(-SHAPE_FACTOR*d2)*wa*wb;
 
-            float vij = 8*kij*CONSTANT;
+            float vij = SHAPE_CONSTANT*kij;
 
             vs += vij;
         }
@@ -289,14 +292,13 @@ __device__ void volume_single(const float * molA, const int * molA_type, int mol
             int ta = molA_type[i];
             int tb = molB_type[j];
 
-            float a = rmat[ta*N_features+tb];
-            float p = pmat[ta*N_features+tb];
+            int lut_idx = ta*N_features+tb;
+            float cf = color_factor[lut_idx];
+            float cpc = color_pp_const[lut_idx];
 
-            float kij = exp(-a*a*d2/(a+a))*wa*wb;
+            float kij = __expf(-cf*d2)*wa*wb;
 
-            float constant = pow(PI/(2*a), 1.5);
-
-            float vij = p*p*kij*constant;
+            float vij = cpc*kij;
 
             vc += vij;
         }
@@ -317,9 +319,10 @@ __device__ void volume_single(const float * molA, const int * molA_type, int mol
 
 // compute shape and color overlap gradients of molA and (molB transformed by q+t) 
 // w.r.t q and t
-__device__ void get_gradient(const float * molA, const int * molA_type, int molA_num_atoms,int NmolA, 
+__device__ void get_gradient(const float * molA, const int * molA_type, int molA_num_atoms,int NmolA,
                              const float * molB, const int * molB_type, int molB_num_atoms,int NmolB,
-                             const float * rmat, const float * pmat, int N_features, 
+                             const float * rmat, const float * pmat, int N_features,
+                             const float * color_factor, const float * color_pp_const,
                              float * gradient, float * gradient_color, const float * q, const float * t, float * v){
     
 
@@ -434,8 +437,9 @@ __device__ void get_gradient(const float * molA, const int * molA_type, int molA
 
             int ta = molA_type[i];
 
-            float a = rmat[ta*N_features+tb];
-            float p = pmat[ta*N_features+tb];
+            int lut_idx = ta*N_features+tb;
+            float cf = color_factor[lut_idx];
+            float cpc = color_pp_const[lut_idx];
 
             // molA needs to be translated by -t
             float molATx = molA[i*D]   - t[0];
@@ -447,27 +451,10 @@ __device__ void get_gradient(const float * molA, const int * molA_type, int molA
             float dz = molATz - molBTr[2];
 
             float d2 = dx*dx + dy*dy + dz*dz;
-            
 
+            float kij = __expf(-cf*d2)*wa*wb;
 
-
-            float inv2a = 1.0/(2*a);
-            float factor = a*a*inv2a;
-        
-            float kij = __expf(-factor*d2)*wa*wb;
-
-            // float constant = pow(PI/(2*a), 1.5);
-
-            // this should be faster
-            // float constant = __powf(PI/(2*a), 1.5);
-
-            // this should be even faster
-            float temp1 = PI*inv2a;
-            float constant = temp1*__fsqrt_rn(temp1);
-            // TODO: should just precompute all factors and constants for all rmat 
-
-            float vij = p*p*kij*constant;
-
+            float vij = cpc*kij;
 
             float x = molBTr[0];
             float y = molBTr[1];
@@ -479,8 +466,7 @@ __device__ void get_gradient(const float * molA, const int * molA_type, int molA
 
             cross_product(C, delta, mv);
 
-            // float temp = -2.0*(a*a)/(a+a)*vij;
-            float temp = -2.0*factor*vij;
+            float temp = -2.0f*cf*vij;
 
             // dq[0] is always zero
             // dq[1-3]: 
@@ -546,22 +532,16 @@ __global__ void optimize(const float * molA_global, const int * molA_type_global
 
     // can only have one shared so we need to store multiple arrays in it
     float * molA = shared;
-    float * qr = (float *)&shared[NmolA*D];    
+    float * qr = (float *)&shared[NmolA*D];
     float * rmat = (float *)&shared[NmolA*D+8];
     float * pmat = (float *)&shared[NmolA*D+8+N_features*N_features];
-    int * molA_type = (int *)&shared[NmolA*D+8+2*N_features*N_features];
+    float * color_factor = (float *)&shared[NmolA*D+8+2*N_features*N_features];
+    float * color_pp_const = (float *)&shared[NmolA*D+8+3*N_features*N_features];
+    int * molA_type = (int *)&shared[NmolA*D+8+4*N_features*N_features];
 
     size_t tidx = threadIdx.x;
 
-    // printf("blockIdx.x: %d, blockDim.x: %d, threadIdx.x: %d\n", 
-        //    blockIdx.x, blockDim.x, threadIdx.x);
-
     if (tidx < NmolA){
-        // copy molA to shared memory
-        //for(int l=tidx; l<NmolA*D; l+=blockDim.x){
-        //    molA[l] = molA_global[l];
-        //} // done by the start mode part now
-        
         // copy molA_type to shared memory
         for(int l=tidx; l<NmolA; l+=blockDim.x){
             molA_type[l] = molA_type_global[l];
@@ -576,6 +556,16 @@ __global__ void optimize(const float * molA_global, const int * molA_type_global
         }
     }
 
+    __syncthreads();
+
+    // Precompute color interaction lookup tables from rmat/pmat
+    for (int l = tidx; l < N_features * N_features; l += blockDim.x) {
+        float a = rmat[l];
+        float p = pmat[l];
+        color_factor[l] = a * 0.5f;
+        float piOver2a = 3.14159265358f / (2.0f * a);
+        color_pp_const[l] = p * p * piOver2a * sqrtf(piOver2a);
+    }
     __syncthreads();
     
 
@@ -614,11 +604,11 @@ __global__ void optimize(const float * molA_global, const int * molA_type_global
 
             volume_single(molA, molA_type, molA_num_atoms_i, NmolA,
                         molA, molA_type, molA_num_atoms_i, NmolA,
-                        rmat, pmat, N_features, va);
+                        rmat, pmat, N_features, color_factor, color_pp_const, va);
 
             volume_single(molB, molB_type, molB_num_atom, NmolB,
                         molB, molB_type, molB_num_atom, NmolB,
-                        rmat, pmat, N_features, vb);
+                        rmat, pmat, N_features, color_factor, color_pp_const, vb);
 
 
             #ifdef DEBUG
@@ -655,9 +645,10 @@ __global__ void optimize(const float * molA_global, const int * molA_type_global
                 float g_c[7] = {0.0,0.0,0.0,0.0,0.0,0.0,0.0};
                 float g_combo[7] = {0.0,0.0,0.0,0.0,0.0,0.0,0.0};
 
-                get_gradient(molA, molA_type, molA_num_atoms_i, NmolA, 
-                            molB, molB_type, molB_num_atom,    NmolB, 
+                get_gradient(molA, molA_type, molA_num_atoms_i, NmolA,
+                            molB, molB_type, molB_num_atom,    NmolB,
                             rmat, pmat, N_features,
+                            color_factor, color_pp_const,
                             g, g_c, q, t, vs);
 
                 // 3. update
@@ -706,6 +697,7 @@ __global__ void optimize(const float * molA_global, const int * molA_type_global
             get_gradient(molA, molA_type, molA_num_atoms_i, NmolA,
                             molB, molB_type, molB_num_atom, NmolB,
                             rmat, pmat, N_features,
+                            color_factor, color_pp_const,
                             temp,temp, q, t, vs);
 
 
@@ -796,9 +788,63 @@ __global__ void optimize(const float * molA_global, const int * molA_type_global
 
 
 
-// Batched optimization kernel: all queries launched in a single kernel.
+// Self-overlap precomputation kernel.
+// Computes volume_single(mol, mol) for each molecule in the batch.
+// Output: self_overlaps (n_mols, 2) containing [shape_overlap, color_overlap].
+// Self-overlap is rotation-invariant, so this can be precomputed once
+// and reused across all start orientations and query/candidate pairs.
+__global__ void compute_self_overlaps_kernel(
+    const float * mols, const int * mol_types, const int * mol_num_atoms,
+    int NmolMax,
+    const float * rmat_global, const float * pmat_global, int N_features,
+    float * self_overlaps,
+    int n_mols
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_mols) return;
+
+    // Load interaction matrices into shared memory
+    extern __shared__ float shared[];
+    float * rmat = shared;
+    float * pmat = &shared[N_features * N_features];
+    float * color_factor = &shared[2 * N_features * N_features];
+    float * color_pp_const = &shared[3 * N_features * N_features];
+
+    size_t tidx = threadIdx.x;
+    for (int l = tidx; l < N_features * N_features; l += blockDim.x) {
+        rmat[l] = rmat_global[l];
+        pmat[l] = pmat_global[l];
+    }
+    __syncthreads();
+
+    // Precompute color interaction lookup tables
+    for (int l = tidx; l < N_features * N_features; l += blockDim.x) {
+        float a = rmat[l];
+        float p = pmat[l];
+        color_factor[l] = a * 0.5f;
+        float piOver2a = 3.14159265358f / (2.0f * a);
+        color_pp_const[l] = p * p * piOver2a * sqrtf(piOver2a);
+    }
+    __syncthreads();
+
+    const float * mol = &mols[(long)idx * NmolMax * D];
+    const int * mol_type = &mol_types[(long)idx * NmolMax];
+    int num_atoms = mol_num_atoms[idx];
+
+    float v[2];
+    volume_single(mol, mol_type, num_atoms, NmolMax,
+                  mol, mol_type, num_atoms, NmolMax,
+                  rmat, pmat, N_features, color_factor, color_pp_const, v);
+
+    self_overlaps[idx * 2]     = v[0];
+    self_overlaps[idx * 2 + 1] = v[1];
+}
+
+// Batched optimization kernel with parallel start modes.
 // blockIdx.x encodes (query_idx, data_block): query_idx = blockIdx.x / blocks_per_batch,
-// data_block = blockIdx.x % blocks_per_batch. Each block loads one query's molA into shared memory.
+// data_block = blockIdx.x % blocks_per_batch.
+// blockIdx.y encodes the start orientation index — each y-block runs one start in parallel.
+// Output layout: (N_starts, n_queries, Nv, DV) — reduced to best start by the caller.
 __global__ void optimize_batched(
     const float * molAs_global,         // (n_queries, NmolA, 4) - all query molecules packed
     const int   * molAs_type_global,    // (n_queries, NmolA)
@@ -806,13 +852,15 @@ __global__ void optimize_batched(
     int NmolA,
     const float * molBs,       const int * molB_types,       const int * molB_num_atoms, int NmolB,
     const float * rmat_global, const float * pmat_global, int N_features,
-    float * scores,            // (n_queries, Nv, DV)
+    float * scores,            // (N_starts, n_queries, Nv, DV)
     int Nv, int blocks_per_batch, int n_queries,
-    bool optim_color, float lr_q, float lr_t, int nsteps, float mixing_param, int start_mode){
+    bool optim_color, float lr_q, float lr_t, int nsteps, float mixing_param, int start_mode,
+    const float * self_overlaps_A, const float * self_overlaps_B){
 
-    // Decode block index into query and data-molecule block
+    // Decode block indices: x = (query, data_block), y = start orientation
     int query_idx  = blockIdx.x / blocks_per_batch;
     int data_block = blockIdx.x % blocks_per_batch;
+    int start_idx  = blockIdx.y;
 
     if (query_idx >= n_queries) return;
 
@@ -822,11 +870,13 @@ __global__ void optimize_batched(
 
     // Shared memory layout (same as original kernel)
     extern __shared__ float shared[];
-    float * molA      = shared;
-    float * qr        = (float *)&shared[NmolA*D];
-    float * rmat      = (float *)&shared[NmolA*D+8];
-    float * pmat      = (float *)&shared[NmolA*D+8+N_features*N_features];
-    int   * molA_type = (int   *)&shared[NmolA*D+8+2*N_features*N_features];
+    float * molA           = shared;
+    float * qr             = (float *)&shared[NmolA*D];
+    float * rmat           = (float *)&shared[NmolA*D+8];
+    float * pmat           = (float *)&shared[NmolA*D+8+N_features*N_features];
+    float * color_factor   = (float *)&shared[NmolA*D+8+2*N_features*N_features];
+    float * color_pp_const = (float *)&shared[NmolA*D+8+3*N_features*N_features];
+    int   * molA_type      = (int   *)&shared[NmolA*D+8+4*N_features*N_features];
 
     size_t tidx = threadIdx.x;
 
@@ -852,152 +902,142 @@ __global__ void optimize_batched(
 
     __syncthreads();
 
-    // Start mode loop
-    int N_starts = start_mode_n[start_mode];
-
-    float scores_register[20];
-    for(int j=0;j<20;++j){
-        scores_register[j]=0.0f;
+    // Precompute color interaction lookup tables from rmat/pmat
+    for (int l = tidx; l < N_features * N_features; l += blockDim.x) {
+        float a = rmat[l];
+        float p = pmat[l];
+        color_factor[l] = a * 0.5f;
+        float piOver2a = 3.14159265358f / (2.0f * a);
+        color_pp_const[l] = p * p * piOver2a * sqrtf(piOver2a);
     }
+    __syncthreads();
 
-    for(int n=0; n<N_starts; n++){
-        if (tidx==0){
-            start_mode_transform(my_molA_global, molA, qr, NmolA, start_mode, n);
-        }
-        __syncthreads();
+    // Apply this block's start orientation (one start per y-block, no loop)
+    if (tidx==0){
+        start_mode_transform(my_molA_global, molA, qr, NmolA, start_mode, start_idx);
+    }
+    __syncthreads();
 
-        if (idx < Nv){
-            const float * molB = &molBs[idx*NmolB*D];
-            const int * molB_type = &molB_types[idx*NmolB];
-            int molB_num_atom = molB_num_atoms[idx];
+    if (idx < Nv){
+        const float * molB = &molBs[idx*NmolB*D];
+        const int * molB_type = &molB_types[idx*NmolB];
+        int molB_num_atom = molB_num_atoms[idx];
 
-            float va[2];
-            float vb[2];
+        float va[2];
+        float vb[2];
 
+        if (self_overlaps_A != nullptr && self_overlaps_B != nullptr) {
+            // Use precomputed self-overlaps (rotation-invariant)
+            va[0] = self_overlaps_A[query_idx * 2];
+            va[1] = self_overlaps_A[query_idx * 2 + 1];
+            vb[0] = self_overlaps_B[idx * 2];
+            vb[1] = self_overlaps_B[idx * 2 + 1];
+        } else {
             volume_single(molA, molA_type, molA_num_atoms_i, NmolA,
                         molA, molA_type, molA_num_atoms_i, NmolA,
-                        rmat, pmat, N_features, va);
+                        rmat, pmat, N_features, color_factor, color_pp_const, va);
 
             volume_single(molB, molB_type, molB_num_atom, NmolB,
                         molB, molB_type, molB_num_atom, NmolB,
-                        rmat, pmat, N_features, vb);
-
-            float q[4] = {1.0,0.0,0.0,0.0};
-            float t[3] = {0.0,0.0,0.0};
-
-            float vs[2] = {0.0,0.0};
-            float cache[7] = {0.0,0.0,0.0,0.0,0.0,0.0,0.0};
-
-            float g_factor = 1.0/(va[0]+vb[0]);
-            float g_c_factor;
-            if(optim_color)
-                g_c_factor = 1.0/(va[1]+vb[1]);
-            else
-                g_c_factor = 0.0;
-
-            for(int k=0; k < nsteps; ++k){
-                float g[7]       = {0.0,0.0,0.0,0.0,0.0,0.0,0.0};
-                float g_c[7]     = {0.0,0.0,0.0,0.0,0.0,0.0,0.0};
-                float g_combo[7] = {0.0,0.0,0.0,0.0,0.0,0.0,0.0};
-
-                get_gradient(molA, molA_type, molA_num_atoms_i, NmolA,
-                            molB, molB_type, molB_num_atom,    NmolB,
-                            rmat, pmat, N_features,
-                            g, g_c, q, t, vs);
-
-                #pragma unroll
-                for(int i=0;i<7;++i){
-                    g[i] = g[i]*g_factor;
-                }
-
-                if (optim_color){
-                    #pragma unroll
-                    for(int i=0;i<7;++i){
-                        g_c[i] = g_c[i]*g_c_factor;
-                    }
-                    #pragma unroll
-                    for(int i=0;i<7;++i){
-                        g_combo[i] = (1-mixing_param)*g[i]+ mixing_param*g_c[i];
-                    }
-                    adagrad_step(q,t,g_combo, cache, lr_q, lr_t);
-                }
-                else{
-                    adagrad_step(q,t,g, cache, lr_q, lr_t);
-                }
-
-                float magq = sqrt(q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3]);
-                q[0] = q[0]/magq;
-                q[1] = q[1]/magq;
-                q[2] = q[2]/magq;
-                q[3] = q[3]/magq;
-            }
-
-            float temp[7] = {0.0,0.0,0.0,0.0,0.0,0.0,0.0};
-            get_gradient(molA, molA_type, molA_num_atoms_i, NmolA,
-                            molB, molB_type, molB_num_atom, NmolB,
-                            rmat, pmat, N_features,
-                            temp,temp, q, t, vs);
-
-            float ts = vs[0] / (va[0]+vb[0] - vs[0]);
-            float tc = 0.0;
-            if(optim_color){
-                tc = vs[1] / (va[1] + vb[1] - vs[1]);
-            }
-            float total = (ts *(1-mixing_param) + tc*mixing_param);
-
-            if (total > scores_register[0]){
-                scores_register[0] = total;
-                scores_register[1] = ts;
-                scores_register[2] = tc;
-                scores_register[3] = vs[0];
-                scores_register[4] = vs[1];
-                scores_register[5] = va[0];
-                scores_register[6] = vb[0];
-                scores_register[7] = va[1];
-                scores_register[8] = vb[1];
-                scores_register[9]  = q[0];
-                scores_register[10] = q[1];
-                scores_register[11] = q[2];
-                scores_register[12] = q[3];
-                scores_register[13] = t[0];
-                scores_register[14] = t[1];
-                scores_register[15] = t[2];
-                scores_register[16] = qr[0];
-                scores_register[17] = qr[1];
-                scores_register[18] = qr[2];
-                scores_register[19] = qr[3];
-            }
-
-        // Write to output: scores layout is (n_queries, Nv, DV)
-        long out_base = (long)query_idx * Nv * DV + idx * DV;
-        scores[out_base]    = scores_register[0];
-        scores[out_base+1]  = scores_register[1];
-        scores[out_base+2]  = scores_register[2];
-        scores[out_base+3]  = scores_register[3];
-        scores[out_base+4]  = scores_register[4];
-        scores[out_base+5]  = scores_register[5];
-        scores[out_base+6]  = scores_register[6];
-        scores[out_base+7]  = scores_register[7];
-        scores[out_base+8]  = scores_register[8];
-        scores[out_base+9]  = scores_register[9];
-        scores[out_base+10] = scores_register[10];
-        scores[out_base+11] = scores_register[11];
-        scores[out_base+12] = scores_register[12];
-        scores[out_base+13] = scores_register[13];
-        scores[out_base+14] = scores_register[14];
-        scores[out_base+15] = scores_register[15];
-        scores[out_base+16] = scores_register[16];
-        scores[out_base+17] = scores_register[17];
-        scores[out_base+18] = scores_register[18];
-        scores[out_base+19] = scores_register[19];
+                        rmat, pmat, N_features, color_factor, color_pp_const, vb);
         }
 
-    __syncthreads();
+        float q[4] = {1.0,0.0,0.0,0.0};
+        float t[3] = {0.0,0.0,0.0};
+
+        float vs[2] = {0.0,0.0};
+        float cache[7] = {0.0,0.0,0.0,0.0,0.0,0.0,0.0};
+
+        float g_factor = 1.0/(va[0]+vb[0]);
+        float g_c_factor;
+        if(optim_color)
+            g_c_factor = 1.0/(va[1]+vb[1]);
+        else
+            g_c_factor = 0.0;
+
+        for(int k=0; k < nsteps; ++k){
+            float g[7]       = {0.0,0.0,0.0,0.0,0.0,0.0,0.0};
+            float g_c[7]     = {0.0,0.0,0.0,0.0,0.0,0.0,0.0};
+            float g_combo[7] = {0.0,0.0,0.0,0.0,0.0,0.0,0.0};
+
+            get_gradient(molA, molA_type, molA_num_atoms_i, NmolA,
+                        molB, molB_type, molB_num_atom,    NmolB,
+                        rmat, pmat, N_features,
+                        color_factor, color_pp_const,
+                        g, g_c, q, t, vs);
+
+            #pragma unroll
+            for(int i=0;i<7;++i){
+                g[i] = g[i]*g_factor;
+            }
+
+            if (optim_color){
+                #pragma unroll
+                for(int i=0;i<7;++i){
+                    g_c[i] = g_c[i]*g_c_factor;
+                }
+                #pragma unroll
+                for(int i=0;i<7;++i){
+                    g_combo[i] = (1-mixing_param)*g[i]+ mixing_param*g_c[i];
+                }
+                adagrad_step(q,t,g_combo, cache, lr_q, lr_t);
+            }
+            else{
+                adagrad_step(q,t,g, cache, lr_q, lr_t);
+            }
+
+            float magq = sqrt(q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3]);
+            q[0] = q[0]/magq;
+            q[1] = q[1]/magq;
+            q[2] = q[2]/magq;
+            q[3] = q[3]/magq;
+        }
+
+        float temp[7] = {0.0,0.0,0.0,0.0,0.0,0.0,0.0};
+        get_gradient(molA, molA_type, molA_num_atoms_i, NmolA,
+                        molB, molB_type, molB_num_atom, NmolB,
+                        rmat, pmat, N_features,
+                        color_factor, color_pp_const,
+                        temp,temp, q, t, vs);
+
+        float ts = vs[0] / (va[0]+vb[0] - vs[0]);
+        float tc = 0.0;
+        if(optim_color){
+            tc = vs[1] / (va[1] + vb[1] - vs[1]);
+        }
+        float total = (ts *(1-mixing_param) + tc*mixing_param);
+
+        // Write to expanded output: (start_idx, query_idx, candidate_idx)
+        long out_base = ((long)start_idx * n_queries * Nv + (long)query_idx * Nv + idx) * DV;
+        scores[out_base]    = total;
+        scores[out_base+1]  = ts;
+        scores[out_base+2]  = tc;
+        scores[out_base+3]  = vs[0];
+        scores[out_base+4]  = vs[1];
+        scores[out_base+5]  = va[0];
+        scores[out_base+6]  = vb[0];
+        scores[out_base+7]  = va[1];
+        scores[out_base+8]  = vb[1];
+        scores[out_base+9]  = q[0];
+        scores[out_base+10] = q[1];
+        scores[out_base+11] = q[2];
+        scores[out_base+12] = q[3];
+        scores[out_base+13] = t[0];
+        scores[out_base+14] = t[1];
+        scores[out_base+15] = t[2];
+        scores[out_base+16] = qr[0];
+        scores[out_base+17] = qr[1];
+        scores[out_base+18] = qr[2];
+        scores[out_base+19] = qr[3];
     }
 }
 
 
-// Batched entry point: all queries in a single kernel launch + single sync
+// Batched entry point: all queries and start orientations in a single kernel launch.
+// Start modes are parallelized across blockIdx.y — no serial loop over starts.
+// Output scores must be sized (N_starts, n_queries, Nv, DV) for start_mode > 0.
+// For start_mode 0 (N_starts=1), output is (1, n_queries, Nv, DV) which is compatible
+// with the original (n_queries, Nv, DV) layout.
 // When stream != 0 (i.e. a PyTorch stream is provided), we skip
 // cudaDeviceSynchronize and rely on stream ordering for correctness.
 void optimize_overlap_gpu_batched(
@@ -1005,17 +1045,22 @@ void optimize_overlap_gpu_batched(
     const float * molBs, const int * molB_types,  const int * molB_num_atoms, int NmolB, long num_molBs,
     const float * rmat, const float * pmat, int N_features, float * scores,
     bool optim_color, float lr_q, float lr_t, int nsteps, float mixing_param, int start_mode, int device_id,
-    cudaStream_t stream){
+    cudaStream_t stream,
+    const float * self_overlaps_A, const float * self_overlaps_B){
+
+    // Host-side start mode table (mirrors __device__ start_mode_n)
+    static const int start_mode_n_host[3] = {1, 4, 10};
+    int N_starts = start_mode_n_host[start_mode];
 
     long Nv = num_molBs;
     int blocks_per_batch = (Nv + NTHREADS - 1) / NTHREADS;
     int total_blocks = n_queries * blocks_per_batch;
 
     dim3 blockDim(NTHREADS);
-    dim3 gridDim(total_blocks);
+    dim3 gridDim(total_blocks, N_starts);  // 2D grid: x = (query, data_block), y = start
 
     const int D_local = 4;
-    size_t sharedMemSize = NmolA*D_local*sizeof(float)+8*sizeof(float)+NmolA*sizeof(int)+2*(N_features*N_features)*sizeof(float);
+    size_t sharedMemSize = NmolA*D_local*sizeof(float)+8*sizeof(float)+NmolA*sizeof(int)+4*(N_features*N_features)*sizeof(float);
 
     cudaSetDevice(device_id);
     optimize_batched<<<gridDim,blockDim,sharedMemSize,stream>>>(
@@ -1023,7 +1068,8 @@ void optimize_overlap_gpu_batched(
         molBs, molB_types, molB_num_atoms, NmolB,
         rmat, pmat, N_features,
         scores, Nv, blocks_per_batch, n_queries,
-        optim_color, lr_q, lr_t, nsteps, mixing_param, start_mode);
+        optim_color, lr_q, lr_t, nsteps, mixing_param, start_mode,
+        self_overlaps_A, self_overlaps_B);
     CUDA_CHECK_ERROR(cudaGetLastError());
 
     // Only synchronize for the default stream (numpy/legacy code path).
@@ -1035,6 +1081,32 @@ void optimize_overlap_gpu_batched(
     }
 }
 
+
+// Precompute self-overlaps for all molecules in a batch.
+// Launches a simple kernel where each thread computes volume_single(mol, mol).
+void compute_self_overlaps_gpu(
+    const float * mols, const int * mol_types, const int * mol_num_atoms,
+    int NmolMax, int n_mols,
+    const float * rmat, const float * pmat, int N_features,
+    float * self_overlaps,
+    int device_id, cudaStream_t stream){
+
+    dim3 blockDim(NTHREADS);
+    dim3 gridDim((n_mols + NTHREADS - 1) / NTHREADS);
+    size_t sharedMemSize = 4 * N_features * N_features * sizeof(float);
+
+    cudaSetDevice(device_id);
+    compute_self_overlaps_kernel<<<gridDim, blockDim, sharedMemSize, stream>>>(
+        mols, mol_types, mol_num_atoms, NmolMax,
+        rmat, pmat, N_features,
+        self_overlaps, n_mols);
+    CUDA_CHECK_ERROR(cudaGetLastError());
+
+    if (stream == 0) {
+        cudaDeviceSynchronize();
+        CUDA_CHECK_ERROR(cudaGetLastError());
+    }
+}
 
 // This is the entry point function. The optimization kernel is lauched from here
 void optimize_overlap_gpu(const float * molA, const int * molA_type, int molA_num_atoms,  int NmolA, 
@@ -1053,7 +1125,7 @@ void optimize_overlap_gpu(const float * molA, const int * molA_type, int molA_nu
     dim3 gridDim((Nv + blockDim.x-1)/blockDim.x); // number of blocks
 
     const int D = 4; // TODO: compile time constant
-    size_t sharedMemSize = NmolA*D*sizeof(float)+8*sizeof(float)+NmolA*sizeof(int)+2*(N_features*N_features)*sizeof(float);
+    size_t sharedMemSize = NmolA*D*sizeof(float)+8*sizeof(float)+NmolA*sizeof(int)+4*(N_features*N_features)*sizeof(float);
    
     //TODO: should check this is not too large
     // std::cout << " sharedMemSize = " << sharedMemSize << " at " << __FILE__ << ":" << __LINE__ << std::endl;
