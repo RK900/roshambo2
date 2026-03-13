@@ -129,24 +129,28 @@ class PheneShapeOverlay:
 
     def __init__(self, max_mols: int = 256, max_atoms: int = 300, n_gpus: int = 1,
                  device_id: int = 0,
-                 allowed_features: List[int] = [18, 19, 20, 21, 22, 36, 41, 42]):
+                 allowed_features: List[Union[int, Tuple[int, ...]]] = [(18, 19), (21, 22), 36, 41, 42]):
         """
         Args:
             max_mols: Maximum batch size expected.
             max_atoms: Maximum atoms (nodes) per molecule expected.
             n_gpus: Number of GPUs to use for roshambo computation.
             device_id: CUDA device ID to allocate on (for DDP, pass local GPU index).
-            allowed_features: List of feature indices to use for color alignment.
-                              Default is [Charge, Aromatic, HB Donor/Acceptor].
+            allowed_features: List of feature specs for color alignment. Each entry
+                              is either an int (single bit index) or a tuple of ints
+                              (OR-collapsed group). Default drops charge=0, collapses
+                              neg charge (18|19) and pos charge (21|22).
         """
         self.max_mols = max_mols
         self.max_atoms = max_atoms
-        self.allowed_features = allowed_features
+        # Normalize: wrap bare ints in tuples for uniform handling
+        self.allowed_features = [
+            (f,) if isinstance(f, int) else tuple(f) for f in allowed_features
+        ]
         self._allowed_tensor = None  # Lazily initialized on correct device
 
-        # Compact color generator: only K+1 types (9) instead of 49,
-        # reducing CUDA shared memory by ~30x for better kernel occupancy
-        n_compact = len(allowed_features)
+        # Compact color generator: only K+1 types (K features + shape type 0)
+        n_compact = len(self.allowed_features)
         self.color_gen = BitVectorColorGenerator(n_bits=n_compact)
 
         # Initialize Persistent Context on the correct device
@@ -159,11 +163,16 @@ class PheneShapeOverlay:
         )
 
     def _get_allowed_tensor(self, device):
-        """Lazily create the allowed_features tensor on the correct device."""
-        if self._allowed_tensor is None or self._allowed_tensor.device != device:
-            self._allowed_tensor = torch.tensor(
-                sorted(self.allowed_features), device=device, dtype=torch.long
-            )
+        """Lazily create the allowed_features index lists on the correct device.
+
+        Returns a list of tensors, one per feature group. Each tensor contains
+        the bit indices that should be OR-collapsed for that feature.
+        """
+        if self._allowed_tensor is None or self._allowed_tensor[0].device != device:
+            self._allowed_tensor = [
+                torch.tensor(group, device=device, dtype=torch.long)
+                for group in self.allowed_features
+            ]
         return self._allowed_tensor
 
     def _prepare_batch_torch(self, mol_graph):
@@ -194,8 +203,8 @@ class PheneShapeOverlay:
         batch_idx = batch_idx[heavy_mask]
 
         num_graphs = int(batch_idx.max().item()) + 1
-        allowed = self._get_allowed_tensor(device)
-        K = allowed.shape[0]
+        allowed_groups = self._get_allowed_tensor(device)
+        K = len(allowed_groups)
 
         # Count real (heavy) atoms per molecule
         batch_idx_long = batch_idx.long()
@@ -208,8 +217,17 @@ class PheneShapeOverlay:
         centroids = sum_pos / n_real.float().unsqueeze(1)
         pos = pos - centroids[batch_idx_long]
 
-        # Single to_dense_batch: combine pos + allowed feature columns
-        combined = torch.cat([pos, x[:, allowed]], dim=-1)  # (N, 3+K)
+        # Build OR-collapsed feature columns: for each group, OR the bits together
+        feat_cols = []
+        for group_idx in allowed_groups:
+            if group_idx.shape[0] == 1:
+                feat_cols.append(x[:, group_idx[0]])
+            else:
+                feat_cols.append(x[:, group_idx].max(dim=-1).values)
+        feat_combined = torch.stack(feat_cols, dim=-1)  # (N, K)
+
+        # Single to_dense_batch: combine pos + collapsed feature columns
+        combined = torch.cat([pos, feat_combined], dim=-1)  # (N, 3+K)
         combined_dense, mask = to_dense_batch(combined, batch_idx)  # (B, M, 3+K)
         pos_dense = combined_dense[:, :, :3]   # (B, M, 3)
         feat_dense = combined_dense[:, :, 3:]  # (B, M, K)

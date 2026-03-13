@@ -57,14 +57,16 @@ class SimpleRoshamboData:
         # Store processed node/pos data temporarily to avoid re-extraction
         processed_mols = []
         
-        # User requested specific features for speed:
-        # Default: Formal Charge (18-22), Aromatic (36), HB Acceptor (41), HB Donor (42)
+        # Normalize allowed_features to list of tuples for OR-group support.
+        # Default: neg charge (18|19), pos charge (21|22), Aromatic (36),
+        #          HB Acceptor (41), HB Donor (42). Drops charge=0 (bit 20).
         if allowed_features is None:
-            self.allowed_features = {18, 19, 20, 21, 22, 36, 41, 42}
+            self.allowed_features = [(18, 19), (21, 22), (36,), (41,), (42,)]
         else:
-            self.allowed_features = set(allowed_features)
-        self._allowed_sorted = np.array(sorted(self.allowed_features))
-        
+            self.allowed_features = [
+                (f,) if isinstance(f, int) else tuple(f) for f in allowed_features
+            ]
+
         for mol_dict in self.mol_list:
             nodes = mol_dict['graph_nodes']
             if hasattr(nodes, 'numpy'): nodes = nodes.numpy()
@@ -87,24 +89,17 @@ class SimpleRoshamboData:
             # Feature extraction
             n_real = pos.shape[0]
 
-            # Feature Atoms
-            active_rows, active_cols = np.where(nodes > 0.5)
-
-            # Filter features
-            if self.allowed_features:
-                mask = np.isin(active_cols, list(self.allowed_features))
-                active_rows = active_rows[mask]
-                active_cols = active_cols[mask]
-
+            # Build OR-collapsed feature columns, then expand to color atoms
             coords_list = [pos]
             types_list = [np.zeros(n_real, dtype=int)] # Real atoms = Type 0
 
-            if len(active_rows) > 0:
-                feat_coords = pos[active_rows]
-                compact_idx = np.searchsorted(self._allowed_sorted, active_cols)
-                feat_types = compact_idx + 1  # compact 1-based types
-                coords_list.append(feat_coords)
-                types_list.append(feat_types.astype(int))
+            for feat_idx, group in enumerate(self.allowed_features):
+                # OR across bits in group: active if any bit > 0.5
+                group_active = np.any(nodes[:, list(group)] > 0.5, axis=1)
+                active_atoms = np.where(group_active)[0]
+                if len(active_atoms) > 0:
+                    coords_list.append(pos[active_atoms])
+                    types_list.append(np.full(len(active_atoms), feat_idx + 1, dtype=int))
 
             all_coords = np.concatenate(coords_list, axis=0)
             all_types = np.concatenate(types_list, axis=0)
