@@ -57,9 +57,17 @@ class PheneOverlayBatchResult:
     @property
     def rotation(self) -> np.ndarray:
         """Rotation Matrices (num_anchors, batch_size, 3, 3)"""
-        quats = self.raw_scores[:, :, 9:13]
-        w, x, y, z = quats[..., 0], quats[..., 1], quats[..., 2], quats[..., 3]
-        R = np.empty(quats.shape[:-1] + (3, 3), dtype=np.float32)
+        raw = self.raw_scores
+        q_opt = raw[:, :, 9:13]
+        q_start = raw[:, :, 16:20]
+        # Hamilton product: q_total = q_opt * q_start
+        w1, x1, y1, z1 = q_opt[..., 0], q_opt[..., 1], q_opt[..., 2], q_opt[..., 3]
+        w2, x2, y2, z2 = q_start[..., 0], q_start[..., 1], q_start[..., 2], q_start[..., 3]
+        w = w1*w2 - x1*x2 - y1*y2 - z1*z2
+        x = w1*x2 + x1*w2 + y1*z2 - z1*y2
+        y = w1*y2 - x1*z2 + y1*w2 + z1*x2
+        z = w1*z2 + x1*y2 - y1*x2 + z1*w2
+        R = np.empty(q_opt.shape[:-1] + (3, 3), dtype=np.float32)
         R[..., 0, 0] = 1 - 2*y*y - 2*z*z
         R[..., 1, 1] = 1 - 2*x*x - 2*z*z
         R[..., 2, 2] = 1 - 2*x*x - 2*y*y
@@ -75,9 +83,16 @@ class PheneOverlayBatchResult:
     def rotation_torch(self) -> torch.Tensor:
         """Rotation Matrices as torch tensor (num_anchors, batch_size, 3, 3)"""
         raw = self.raw_scores_torch
-        quats = raw[:, :, 9:13]
-        w, x, y, z = quats[..., 0], quats[..., 1], quats[..., 2], quats[..., 3]
-        R = torch.empty(quats.shape[:-1] + (3, 3), dtype=torch.float32, device=quats.device)
+        q_opt = raw[:, :, 9:13]
+        q_start = raw[:, :, 16:20]
+        # Hamilton product: q_total = q_opt * q_start
+        w1, x1, y1, z1 = q_opt[..., 0], q_opt[..., 1], q_opt[..., 2], q_opt[..., 3]
+        w2, x2, y2, z2 = q_start[..., 0], q_start[..., 1], q_start[..., 2], q_start[..., 3]
+        w = w1*w2 - x1*x2 - y1*y2 - z1*z2
+        x = w1*x2 + x1*w2 + y1*z2 - z1*y2
+        y = w1*y2 - x1*z2 + y1*w2 + z1*x2
+        z = w1*z2 + x1*y2 - y1*x2 + z1*w2
+        R = torch.empty(q_opt.shape[:-1] + (3, 3), dtype=torch.float32, device=raw.device)
         R[..., 0, 0] = 1 - 2*y*y - 2*z*z
         R[..., 1, 1] = 1 - 2*x*x - 2*z*z
         R[..., 2, 2] = 1 - 2*x*x - 2*y*y
@@ -114,24 +129,29 @@ class PheneShapeOverlay:
 
     def __init__(self, max_mols: int = 256, max_atoms: int = 300, n_gpus: int = 1,
                  device_id: int = 0,
-                 allowed_features: List[int] = [18, 19, 20, 21, 22, 36, 41, 42]):
+                 allowed_features: List[Union[int, Tuple[int, ...]]] = [(18, 19), (21, 22), 36, 41, 42]):
         """
         Args:
             max_mols: Maximum batch size expected.
             max_atoms: Maximum atoms (nodes) per molecule expected.
             n_gpus: Number of GPUs to use for roshambo computation.
             device_id: CUDA device ID to allocate on (for DDP, pass local GPU index).
-            allowed_features: List of feature indices to use for color alignment.
-                              Default is [Charge, Aromatic, HB Donor/Acceptor].
+            allowed_features: List of feature specs for color alignment. Each entry
+                              is either an int (single bit index) or a tuple of ints
+                              (OR-collapsed group). Default drops charge=0, collapses
+                              neg charge (18|19) and pos charge (21|22).
         """
         self.max_mols = max_mols
         self.max_atoms = max_atoms
-        self.allowed_features = allowed_features
+        # Normalize: wrap bare ints in tuples for uniform handling
+        self.allowed_features = [
+            (f,) if isinstance(f, int) else tuple(f) for f in allowed_features
+        ]
         self._allowed_tensor = None  # Lazily initialized on correct device
 
-        # Initialize Color Generator
-        # Phene generator produces 48 dim features + padding -> 49
-        self.color_gen = BitVectorColorGenerator(n_bits=48)
+        # Compact color generator: only K+1 types (K features + shape type 0)
+        n_compact = len(self.allowed_features)
+        self.color_gen = BitVectorColorGenerator(n_bits=n_compact)
 
         # Initialize Persistent Context on the correct device
         self.overlay = PersistentCudaShapeOverlay(
@@ -143,24 +163,31 @@ class PheneShapeOverlay:
         )
 
     def _get_allowed_tensor(self, device):
-        """Lazily create the allowed_features tensor on the correct device."""
-        if self._allowed_tensor is None or self._allowed_tensor.device != device:
-            self._allowed_tensor = torch.tensor(
-                sorted(self.allowed_features), device=device, dtype=torch.long
-            )
+        """Lazily create the allowed_features index lists on the correct device.
+
+        Returns a list of tensors, one per feature group. Each tensor contains
+        the bit indices that should be OR-collapsed for that feature.
+        """
+        if self._allowed_tensor is None or self._allowed_tensor[0].device != device:
+            self._allowed_tensor = [
+                torch.tensor(group, device=device, dtype=torch.long)
+                for group in self.allowed_features
+            ]
         return self._allowed_tensor
 
     def _prepare_batch_torch(self, mol_graph):
         """
-        GPU-native feature expansion. Replaces _unbatch + SimpleRoshamboData.
-        Converts a PyG Batch into padded (B, max_atoms, 4) tensors entirely on GPU.
+        GPU-native feature expansion. Converts a PyG Batch into padded
+        (B, max_atoms, 4) tensors entirely on GPU.
+
+        Optimized path: single to_dense_batch call, no argsort, compact types.
 
         Args:
             mol_graph: PyG Batch with .x (N_total, 48), .pos (N_total, 3), .batch (N_total,)
 
         Returns:
             f_x: (B, max_atoms_dense, 4) float32 CUDA tensor [x, y, z, weight]
-            f_types: (B, max_atoms_dense) int32 CUDA tensor
+            f_types: (B, max_atoms_dense) int32 CUDA tensor (compact types 0..K)
             f_n_real: (B,) int32 CUDA tensor (number of real atoms per molecule)
             num_graphs: int
         """
@@ -169,50 +196,74 @@ class PheneShapeOverlay:
         batch_idx = mol_graph.batch  # (N_total,)
         device = x.device
 
+        # Remove H atoms (bit 0 = H atom type)
+        heavy_mask = x[:, 0] < 0.5
+        x = x[heavy_mask]
+        pos = pos[heavy_mask]
+        batch_idx = batch_idx[heavy_mask]
+
         num_graphs = int(batch_idx.max().item()) + 1
-        allowed = self._get_allowed_tensor(device)
+        allowed_groups = self._get_allowed_tensor(device)
+        K = len(allowed_groups)
 
-        # Count real atoms per molecule
+        # Count real (heavy) atoms per molecule
+        batch_idx_long = batch_idx.long()
         n_real = torch.zeros(num_graphs, device=device, dtype=torch.int32)
-        n_real.scatter_add_(0, batch_idx.long(), torch.ones(batch_idx.shape[0], device=device, dtype=torch.int32))
+        n_real.scatter_add_(0, batch_idx_long, torch.ones(batch_idx.shape[0], device=device, dtype=torch.int32))
 
-        # Feature expansion: find active (> 0.5) features in allowed columns
-        feat_vals = x[:, allowed]  # (N_total, n_allowed)
-        active_rows, active_cols_local = torch.where(feat_vals > 0.5)
+        # COM centering (required for CUDA optimizer convergence)
+        sum_pos = torch.zeros(num_graphs, 3, device=device, dtype=pos.dtype)
+        sum_pos.scatter_add_(0, batch_idx_long.unsqueeze(1).expand(-1, 3), pos)
+        centroids = sum_pos / n_real.float().unsqueeze(1)
+        pos = pos - centroids[batch_idx_long]
 
-        # Feature types: allowed[col] + 1 (1-based, type 0 = real atom)
-        feat_types = (allowed[active_cols_local] + 1).int()
-        feat_pos = pos[active_rows]
-        feat_batch = batch_idx[active_rows]
+        # Build OR-collapsed feature columns: for each group, OR the bits together
+        feat_cols = []
+        for group_idx in allowed_groups:
+            if group_idx.shape[0] == 1:
+                feat_cols.append(x[:, group_idx[0]])
+            else:
+                feat_cols.append(x[:, group_idx].max(dim=-1).values)
+        feat_combined = torch.stack(feat_cols, dim=-1)  # (N, K)
 
-        # Concatenate real atoms + feature atoms
-        all_pos = torch.cat([pos, feat_pos], dim=0)
-        all_types = torch.cat([
-            torch.zeros(pos.shape[0], device=device, dtype=torch.int32),
-            feat_types
-        ], dim=0)
-        all_batch = torch.cat([batch_idx, feat_batch], dim=0)
+        # Single to_dense_batch: combine pos + collapsed feature columns
+        combined = torch.cat([pos, feat_combined], dim=-1)  # (N, 3+K)
+        combined_dense, mask = to_dense_batch(combined, batch_idx)  # (B, M, 3+K)
+        pos_dense = combined_dense[:, :, :3]   # (B, M, 3)
+        feat_dense = combined_dense[:, :, 3:]  # (B, M, K)
+        M = pos_dense.shape[1]
 
-        # Sort by batch index (required by to_dense_batch)
-        sort_idx = torch.argsort(all_batch, stable=True)
-        all_pos = all_pos[sort_idx]
-        all_types = all_types[sort_idx]
-        all_batch = all_batch[sort_idx]
+        # Feature expansion in dense space (no argsort needed)
+        feat_active = (feat_dense > 0.5) & mask.unsqueeze(-1)  # (B, M, K)
 
-        # Pad to dense: (B, max_atoms_dense, 3) and mask
-        pos_dense, mask = to_dense_batch(all_pos, all_batch)
+        # Count feature atoms per molecule to determine output size
+        feat_flat = feat_active.reshape(num_graphs, M * K)  # (B, M*K)
+        n_feat_per_mol = feat_flat.sum(dim=1)
+        M_total = int((n_real + n_feat_per_mol).max().item())
 
-        # Types: use float wrapper for to_dense_batch, then cast back
-        types_dense, _ = to_dense_batch(
-            all_types.float().unsqueeze(-1), all_batch
-        )
-        types_dense = types_dense.squeeze(-1).int()
+        # Allocate output
+        f_x = torch.zeros(num_graphs, M_total, 4, device=device)
+        f_types = torch.zeros(num_graphs, M_total, device=device, dtype=torch.int32)
 
-        # Build f_x: (B, max_atoms_dense, 4) with weight=1.0 for valid atoms
-        weight = mask.float().unsqueeze(-1)
-        f_x = torch.cat([pos_dense, weight], dim=-1)
+        # Real atoms (positions 0..M-1, with mask for padding)
+        f_x[:, :M, :3] = pos_dense
+        f_x[:, :M, 3] = mask.float()
 
-        return f_x.contiguous(), types_dense.contiguous(), n_real, num_graphs
+        # Feature atoms: scatter after each molecule's real atoms using cumsum offsets
+        if n_feat_per_mol.sum() > 0:
+            feat_cum = torch.cumsum(feat_flat.int(), dim=1)  # (B, M*K)
+            b_idx, j_idx = torch.where(feat_flat)
+            atom_idx = j_idx // K
+            feat_k = j_idx % K
+
+            # Place feature atoms right after real atoms for each molecule
+            target_col = n_real[b_idx].long() + feat_cum[b_idx, j_idx].long() - 1
+
+            f_x[b_idx, target_col, :3] = pos_dense[b_idx, atom_idx]
+            f_x[b_idx, target_col, 3] = 1.0
+            f_types[b_idx, target_col] = (feat_k + 1).int()  # compact types 1..K
+
+        return f_x.contiguous(), f_types.contiguous(), n_real, num_graphs
 
     def _unbatch(self, batch_data) -> List[Dict[str, np.ndarray]]:
         """

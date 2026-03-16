@@ -34,6 +34,7 @@
 #include "cuda_functions.cuh"
 #include <omp.h>
 #include <vector>
+#include <c10/cuda/CUDAStream.h>
 
 namespace py = pybind11;
 
@@ -291,10 +292,6 @@ public:
         RMAT = RMAT.contiguous().to(torch::kFloat32);
         PMAT = PMAT.contiguous().to(torch::kFloat32);
 
-        // AN/BN are small (one int per molecule) - move to CPU for host-side access
-        auto AN_cpu = AN.to(torch::kCPU).contiguous().to(torch::kInt32);
-        auto BN_cpu = BN.to(torch::kCPU).contiguous().to(torch::kInt32);
-
         long current_n_mols = B.size(0);
         long current_mol_atoms = B.size(1);
         long query_mol_atoms = A.size(1);
@@ -314,24 +311,49 @@ public:
                                  B.is_cuda() && B.device().index() == device_id;
 
             if (all_on_device) {
-                // Ensure interaction matrices and BN are on device
+                // Ensure interaction matrices and AN/BN are on device
                 auto rmat_d = RMAT.to(target_device).contiguous();
                 auto pmat_d = PMAT.to(target_device).contiguous();
                 auto BN_d = BN.to(target_device).contiguous().to(torch::kInt32);
+                auto AN_d = AN.to(target_device).contiguous().to(torch::kInt32);
 
                 // Ensure output tensor is on device
                 TORCH_CHECK(V.is_cuda() && V.device().index() == device_id,
                             "Output tensor V must be on CUDA device " + std::to_string(device_id));
 
-                // Loop over queries - pass tensor data_ptrs directly to kernel
-                for (int64_t i = 0; i < A.size(0); ++i) {
-                    int molA_atoms_i = AN_cpu.data_ptr<int>()[i];
+                int64_t n_queries = A.size(0);
 
-                    optimize_overlap_gpu(
-                        A.data_ptr<float>() + i * query_mol_atoms * 4,
-                        AT.data_ptr<int>() + i * query_mol_atoms,
-                        molA_atoms_i,
+                // Get PyTorch's current CUDA stream for proper pipeline integration.
+                cudaStream_t stream = c10::cuda::getCurrentCUDAStream(device_id).stream();
+
+                // Host-side start mode table (mirrors __device__ start_mode_n)
+                static const int start_mode_n_host[3] = {1, 4, 10};
+                int N_starts = start_mode_n_host[start_mode_method];
+
+                // Precompute self-overlaps for queries and candidates
+                auto self_overlaps_A = torch::empty({n_queries, 2}, V.options());
+                auto self_overlaps_B = torch::empty({(int64_t)current_n_mols, 2}, V.options());
+
+                compute_self_overlaps_gpu(
+                    A.data_ptr<float>(), AT.data_ptr<int>(), AN_d.data_ptr<int>(),
+                    (int)query_mol_atoms, (int)n_queries,
+                    rmat_d.data_ptr<float>(), pmat_d.data_ptr<float>(), n_features,
+                    self_overlaps_A.data_ptr<float>(), device_id, stream);
+
+                compute_self_overlaps_gpu(
+                    B.data_ptr<float>(), BT.data_ptr<int>(), BN_d.data_ptr<int>(),
+                    (int)current_mol_atoms, (int)current_n_mols,
+                    rmat_d.data_ptr<float>(), pmat_d.data_ptr<float>(), n_features,
+                    self_overlaps_B.data_ptr<float>(), device_id, stream);
+
+                if (N_starts <= 1) {
+                    // Single start: output directly to V (no overhead)
+                    optimize_overlap_gpu_batched(
+                        A.data_ptr<float>(),
+                        AT.data_ptr<int>(),
+                        AN_d.data_ptr<int>(),
                         (int)query_mol_atoms,
+                        (int)n_queries,
                         B.data_ptr<float>(),
                         BT.data_ptr<int>(),
                         BN_d.data_ptr<int>(),
@@ -340,16 +362,61 @@ public:
                         rmat_d.data_ptr<float>(),
                         pmat_d.data_ptr<float>(),
                         n_features,
-                        V.data_ptr<float>() + i * V.size(1) * V.size(2),
+                        V.data_ptr<float>(),
                         optim_color, lr_q, lr_t, nsteps, mixing_param,
-                        start_mode_method, device_id
+                        start_mode_method, device_id,
+                        stream,
+                        self_overlaps_A.data_ptr<float>(),
+                        self_overlaps_B.data_ptr<float>()
                     );
+                } else {
+                    // Parallel starts: kernel writes (N_starts, n_queries, n_mols, DV),
+                    // then we reduce to the best start per (query, candidate) pair.
+                    auto V_expanded = torch::empty(
+                        {(int64_t)N_starts, n_queries, (int64_t)current_n_mols, (int64_t)scores_dim},
+                        V.options()
+                    );
+
+                    optimize_overlap_gpu_batched(
+                        A.data_ptr<float>(),
+                        AT.data_ptr<int>(),
+                        AN_d.data_ptr<int>(),
+                        (int)query_mol_atoms,
+                        (int)n_queries,
+                        B.data_ptr<float>(),
+                        BT.data_ptr<int>(),
+                        BN_d.data_ptr<int>(),
+                        (int)current_mol_atoms,
+                        current_n_mols,
+                        rmat_d.data_ptr<float>(),
+                        pmat_d.data_ptr<float>(),
+                        n_features,
+                        V_expanded.data_ptr<float>(),
+                        optim_color, lr_q, lr_t, nsteps, mixing_param,
+                        start_mode_method, device_id,
+                        stream,
+                        self_overlaps_A.data_ptr<float>(),
+                        self_overlaps_B.data_ptr<float>()
+                    );
+
+                    // Reduce: find best start per (query, candidate) using combo score (index 0)
+                    auto combo_scores = V_expanded.select(-1, 0);  // (N_starts, n_queries, n_mols)
+                    auto best_idx = std::get<1>(combo_scores.max(0));  // (n_queries, n_mols)
+
+                    // Gather best scores into output V
+                    auto gather_idx = best_idx.unsqueeze(0).unsqueeze(-1)
+                                      .expand({1, n_queries, (int64_t)current_n_mols, (int64_t)scores_dim});
+                    V.copy_(V_expanded.gather(0, gather_idx).squeeze(0));
                 }
                 return;
             }
         }
 
         // Fallback: multi-GPU or cross-device — copy to pre-allocated buffers
+        // Need AN/BN on CPU for host-side indexing in the per-query loop
+        auto AN_cpu = AN.to(torch::kCPU).contiguous().to(torch::kInt32);
+        auto BN_cpu = BN.to(torch::kCPU).contiguous().to(torch::kInt32);
+
         int base_len = current_n_mols / n_gpus;
         int remainder = current_n_mols % n_gpus;
 

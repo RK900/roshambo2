@@ -26,6 +26,10 @@ find_package(pybind11)
 find_package(Torch REQUIRED)
 find_library(TORCH_PYTHON_LIBRARY torch_python HINTS "${TORCH_INSTALL_PREFIX}/lib")
 
+# Filter out NOTFOUND entries that leak from PyTorch's CMake config
+# when optional CUDA libs (nvrtc, kineto, etc.) are not installed with dev symlinks
+list(FILTER TORCH_LIBRARIES EXCLUDE REGEX ".*NOTFOUND.*")
+
 if (BUILD_WITH_CUDA)
     include_directories("${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}")
 endif (BUILD_WITH_CUDA)

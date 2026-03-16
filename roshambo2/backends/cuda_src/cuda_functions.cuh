@@ -51,7 +51,22 @@ __device__ __constant__ int D = 4;
 
 
 
-void optimize_overlap_gpu(const float * molA, const int * molA_type, int molA_num_atoms,  int NmolA, 
-                          const float * molBs,const int * molB_types, const int * molB_num_atoms, int NmolB, long num_molBs, 
+void optimize_overlap_gpu(const float * molA, const int * molA_type, int molA_num_atoms,  int NmolA,
+                          const float * molBs,const int * molB_types, const int * molB_num_atoms, int NmolB, long num_molBs,
                           const float * rmat, const float * pmat, int N_features, float * scores, bool optim_color,  float lr_q, float lr_t, int nsteps, float mixing_param, int start_mode, int device_id);
+
+void optimize_overlap_gpu_batched(
+    const float * molAs, const int * molAs_types, const int * molA_num_atoms, int NmolA, int n_queries,
+    const float * molBs, const int * molB_types,  const int * molB_num_atoms, int NmolB, long num_molBs,
+    const float * rmat, const float * pmat, int N_features, float * scores,
+    bool optim_color, float lr_q, float lr_t, int nsteps, float mixing_param, int start_mode, int device_id,
+    cudaStream_t stream = 0,
+    const float * self_overlaps_A = nullptr, const float * self_overlaps_B = nullptr);
+
+void compute_self_overlaps_gpu(
+    const float * mols, const int * mol_types, const int * mol_num_atoms,
+    int NmolMax, int n_mols,
+    const float * rmat, const float * pmat, int N_features,
+    float * self_overlaps,
+    int device_id, cudaStream_t stream = 0);
 
