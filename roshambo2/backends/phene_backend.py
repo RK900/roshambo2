@@ -324,11 +324,14 @@ class PheneShapeOverlay:
         query_f_n_real = f_n_real[idx_tensor]  # (n_valid_anchors,)
 
         # 3. Single CUDA call — zero copy
+        # Candidates are the query (molA, gets aligned), anchors are the reference (molB/data)
         all_scores = self.overlay.calculate_overlap_batch_torch(
-            query_f_x, query_f_types, query_f_n_real,
             f_x, f_types, f_n_real,
+            query_f_x, query_f_types, query_f_n_real,
             self.color_gen, mixing=mixing
         )
+        # Result is (B, A_valid, 20) — transpose to (A_valid, B, 20)
+        all_scores = all_scores.permute(1, 0, 2).contiguous()
 
         # 4. Handle invalid anchors by padding
         if len(valid_anchor_indices) < num_anchors:
@@ -369,10 +372,13 @@ class PheneShapeOverlay:
                 np.zeros((num_anchors, batch_size, 20), dtype=np.float32), num_anchors, batch_size
             )
 
-        query_data = SimpleRoshamboData(anchor_mols, name="Anchors", allowed_features=self.allowed_features)
+        # Candidates are the query (molA, gets aligned), anchors are the reference (molB/data)
+        anchor_data = SimpleRoshamboData(anchor_mols, name="Anchors", allowed_features=self.allowed_features)
         all_scores = self.overlay.calculate_overlap_batch(
-            query_data, candidates_data, mixing=mixing, color_generator=self.color_gen
+            candidates_data, anchor_data, mixing=mixing, color_generator=self.color_gen
         )
+        # Result is (B, A_valid, 20) — transpose to (A_valid, B, 20)
+        all_scores = np.transpose(all_scores, (1, 0, 2)).copy()
 
         if len(valid_anchor_indices) < num_anchors:
             padded_scores = np.zeros((num_anchors, batch_size, 20), dtype=np.float32)
